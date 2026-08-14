@@ -1,3 +1,5 @@
+import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -5,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+import nanochat.nemotron_data as nemotron_data
 from nanochat.nemotron_data import (
     SEGMENT_SEQUENCE_COUNT,
     SEGMENT_TOKEN_COUNT,
@@ -123,6 +126,29 @@ def test_exact_production_quotas():
         707_840,
         107_520,
     ]
+
+
+def test_download_atomic_retries_truncated_response(tmp_path, monkeypatch):
+    payload = b"pinned artifact contents"
+    responses = [payload[:-4], payload]
+
+    def fake_urlopen(_request, timeout):
+        assert timeout == 120
+        return io.BytesIO(responses.pop(0))
+
+    monkeypatch.setattr(nemotron_data.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(nemotron_data.time, "sleep", lambda _seconds: None)
+    target = tmp_path / "artifact.bin"
+    nemotron_data._download_atomic(
+        "https://example.invalid/artifact.bin",
+        target,
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert target.read_bytes() == payload
+    assert responses == []
+    assert not list(tmp_path.glob("artifact.bin.partial.*"))
 
 
 def test_d10_model_shape_and_parameter_count():

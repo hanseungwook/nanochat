@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
@@ -236,24 +237,43 @@ def _download_atomic(url: str, path: Path, expected_size: int, expected_hash: st
     if path.is_file() and path.stat().st_size == expected_size and sha256_file(path) == expected_hash:
         return
     _mkdir_group(path.parent)
-    partial = path.with_name(path.name + ".partial")
     request = urllib.request.Request(url, headers={"User-Agent": "nanochat-nemotron-prep/1"})
-    digest = hashlib.sha256()
-    size = 0
-    with urllib.request.urlopen(request) as response, open(partial, "wb") as handle:
-        while chunk := response.read(8 << 20):
-            handle.write(chunk)
-            digest.update(chunk)
-            size += len(chunk)
-        handle.flush()
-        os.fsync(handle.fileno())
-    if size != expected_size or digest.hexdigest() != expected_hash:
-        partial.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"Downloaded artifact mismatch for {path}: size={size}, sha256={digest.hexdigest()}"
-        )
-    os.chmod(partial, 0o664)
-    os.replace(partial, path)
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        partial: Path | None = None
+        try:
+            digest = hashlib.sha256()
+            size = 0
+            with urllib.request.urlopen(request, timeout=120) as response, tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=path.name + ".partial.",
+                delete=False,
+            ) as handle:
+                partial = Path(handle.name)
+                while chunk := response.read(8 << 20):
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            observed_hash = digest.hexdigest()
+            if size != expected_size or observed_hash != expected_hash:
+                raise RuntimeError(
+                    f"Downloaded artifact mismatch for {path}: expected size={expected_size}, "
+                    f"sha256={expected_hash}; received size={size}, sha256={observed_hash}"
+                )
+            os.chmod(partial, 0o664)
+            os.replace(partial, path)
+            partial = None
+            return
+        except Exception:
+            if attempt == max_attempts:
+                raise
+            time.sleep(min(2**attempt, 30))
+        finally:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
 
 
 def download_tokenizer_artifact(layout: DataLayout) -> dict:
