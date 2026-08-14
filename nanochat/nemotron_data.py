@@ -15,6 +15,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
@@ -202,14 +203,26 @@ def check_free_space(path: Path, min_free_gb: float = DEFAULT_MIN_FREE_GB) -> in
 
 def _atomic_json(path: Path, value: object) -> None:
     _mkdir_group(path.parent)
-    partial = path.with_name(path.name + ".partial")
-    with open(partial, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True, ensure_ascii=False)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(partial, path)
-    os.chmod(path, 0o664)
+    partial: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=path.name + ".partial.",
+            delete=False,
+        ) as handle:
+            partial = Path(handle.name)
+            json.dump(value, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, path)
+        partial = None
+        os.chmod(path, 0o664)
+    finally:
+        if partial is not None:
+            partial.unlink(missing_ok=True)
 
 
 def _status(layout: DataLayout, stage: str, payload: dict, job_index: int | None = None) -> Path:
