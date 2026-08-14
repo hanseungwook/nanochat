@@ -27,10 +27,19 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.packed_data import (
+    SAMPLER_VERSION,
+    PackedShardReader,
+    load_manifest,
+    packed_distributed_data_loader_with_state,
+    packed_distributed_validation_loader,
+    resolve_split_shards,
+    validate_training_compatibility,
+)
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, load_optimizer_state_resharded
+from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -43,6 +52,13 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+data_root = os.environ.get("NANOCHAT_DATA_ROOT")
+default_manifest = os.path.join(data_root, "datasets", "nemotron-specialized-v1", "9ed3718b5f2ae29074c5e34e64115432b7c4320f", "packed", "v1", "manifest.json") if data_root else None
+default_tokenizer_dir = os.path.join(data_root, "tokenizers", "nanochat-d32", "016dba034c9c0ca9033ad1bc721bceff54680600") if data_root else None
+parser.add_argument("--dataset-manifest", type=str, default=default_manifest, help="packed dataset manifest (unset preserves the ClimbMix loader)")
+parser.add_argument("--dataset-split", type=str, default="train_50b", choices=["train_50b", "train_100b"], help="named packed training split")
+parser.add_argument("--tokenizer-dir", type=str, default=default_tokenizer_dir, help="pinned tokenizer artifact directory")
+parser.add_argument("--data-cache-dir", type=str, default=None, help="optional node-local packed shard cache")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -56,6 +72,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--target-train-tokens", type=int, default=-1, help="packed-data token horizon (-1 = complete selected split)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
@@ -71,13 +88,46 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-device-batch-size", type=int, default=-1, help="per-device packed validation batch (-1 = device batch size)")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-at-steps", type=str, default="", help="comma-separated additional optimizer steps to checkpoint")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+try:
+    save_at_steps = {int(value) for value in args.save_at_steps.split(",") if value.strip()}
+except ValueError:
+    parser.error("--save-at-steps must be a comma-separated list of integers")
+if any(step <= 0 for step in save_at_steps):
+    parser.error("--save-at-steps values must be positive")
+packed_manifest = None
+packed_target_tokens = None
+if args.dataset_manifest:
+    if args.tokenizer_dir is None:
+        parser.error("--tokenizer-dir is required with --dataset-manifest")
+    packed_manifest = load_manifest(args.dataset_manifest)
+    if args.total_batch_size == -1:
+        args.total_batch_size = 524288
+    packed_target_tokens = validate_training_compatibility(
+        packed_manifest,
+        args.dataset_split,
+        args.tokenizer_dir,
+        context_length=args.max_seq_len,
+        target_tokens=args.target_train_tokens,
+        global_token_batch=args.total_batch_size,
+    )
+    # Stat every selected shard and validate its declared row/byte length before
+    # model allocation. Full content checksums belong to prepare_nemotron verify.
+    PackedShardReader(
+        args.dataset_manifest,
+        resolve_split_shards(packed_manifest, args.dataset_split),
+        args.max_seq_len + 1,
+    )
+    if args.num_iterations > 0 and args.num_iterations * args.total_batch_size != packed_target_tokens:
+        parser.error("--num-iterations conflicts with --target-train-tokens for packed data")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -116,12 +166,48 @@ else:
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
 
+if packed_manifest is not None and device_type == "cuda" and not using_fa3:
+    raise RuntimeError("Packed Nemotron production training requires Flash Attention 3 on every CUDA rank")
+
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+tokenizer = get_tokenizer(args.tokenizer_dir)
+token_bytes = get_token_bytes(device=device, tokenizer_dir=args.tokenizer_dir)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
+
+# Resolve checkpoint metadata before model allocation so incompatible packed-data
+# resumes fail without spending GPU memory.
+base_dir = get_base_dir()
+output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+resuming = args.resume_from_step != -1
+resume_meta = None
+if resuming:
+    meta_path = os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        resume_meta = json.load(f)
+    if packed_manifest is not None:
+        expected_packed = {
+            "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
+            "split": args.dataset_split,
+            "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
+            "optimizer_step": args.resume_from_step,
+            "global_sequence_offset": args.resume_from_step * (args.total_batch_size // args.max_seq_len),
+            "global_batch_sequences": args.total_batch_size // args.max_seq_len,
+            "context_length": args.max_seq_len,
+            "sampler_version": SAMPLER_VERSION,
+        }
+        saved_packed = resume_meta.get("packed_data")
+        if saved_packed is None:
+            raise RuntimeError("Cannot resume packed training from a checkpoint without packed-data metadata")
+        mismatches = {
+            key: (saved_packed.get(key), value)
+            for key, value in expected_packed.items()
+            if saved_packed.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(f"Packed-data checkpoint mismatch: {mismatches}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -151,13 +237,17 @@ model.to_empty(device=device) # 2) All tensors get storage on target device but 
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    saved_optimizer_world_size = (resume_meta.get("packed_data") or {}).get("optimizer_world_size", ddp_world_size)
+    same_optimizer_topology = saved_optimizer_world_size == ddp_world_size
+    model_data, optimizer_data, meta_data = load_checkpoint(
+        checkpoint_dir,
+        args.resume_from_step,
+        device,
+        load_optimizer=same_optimizer_topology,
+        rank=ddp_rank,
+    )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -199,8 +289,6 @@ def disable_fp8(model):
     CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
     we swap out Float8Linear modules entirely and restore them after.
     """
-    import torch.nn as nn
-
     # Find all Float8Linear modules and their locations
     fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
     for name, module in model.named_modules():
@@ -250,7 +338,7 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 
 # Get the parameter counts of our model
 param_counts = model.num_scaling_params()
-print0(f"Parameter counts:")
+print0("Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
@@ -266,11 +354,12 @@ def get_scaling_params(m):
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
-target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
+target_tokens = packed_target_tokens if packed_manifest is not None else int(args.target_param_data_ratio * num_scaling_params) # actual packed horizon or scaling-law target
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 d12_ref = build_model_meta(12) # creates the model on meta device
-D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
+reference_param_data_ratio = args.target_param_data_ratio if args.target_param_data_ratio > 0 else 12
+D_REF = reference_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
 # 2) Now that we have the token horizon, we can calculate the optimal batch size
@@ -316,6 +405,15 @@ optimizer = model.setup_optimizer(
 )
 
 if resuming:
+    if optimizer_data is None:
+        optimizer_data = load_optimizer_state_resharded(
+            checkpoint_dir,
+            args.resume_from_step,
+            optimizer,
+            saved_optimizer_world_size,
+            ddp_rank,
+            ddp_world_size,
+        )
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
@@ -327,17 +425,45 @@ if scaler is not None:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+eval_device_batch_size = args.device_batch_size if args.eval_device_batch_size == -1 else args.eval_device_batch_size
+if packed_manifest is not None:
+    train_loader = packed_distributed_data_loader_with_state(
+        args.dataset_manifest,
+        args.dataset_split,
+        args.device_batch_size,
+        args.max_seq_len,
+        device,
+        total_batch_size,
+        start_step=args.resume_from_step if resuming else 0,
+        rank=ddp_rank,
+        world_size=ddp_world_size,
+        data_cache_dir=args.data_cache_dir,
+    )
+    build_val_loader = lambda split_name: packed_distributed_validation_loader(
+        args.dataset_manifest,
+        split_name,
+        eval_device_batch_size,
+        args.max_seq_len,
+        device,
+        rank=ddp_rank,
+        world_size=ddp_world_size,
+        data_cache_dir=args.data_cache_dir,
+    )
+else:
+    dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, eval_device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
 
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
-assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
-if args.num_iterations > 0:
+assert packed_manifest is not None or args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
+if packed_manifest is not None:
+    num_iterations = packed_target_tokens // total_batch_size
+    print0(f"Calculated number of iterations from packed token horizon: {num_iterations:,}")
+elif args.num_iterations > 0:
     # Override num_iterations to a specific value if given
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
@@ -420,19 +546,55 @@ while True:
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
-        val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            if packed_manifest is not None:
+                source_metrics = {}
+                for source in packed_manifest["sources"]:
+                    split_name = f"validation/{source['name']}"
+                    split_tokens = packed_manifest["splits"][split_name]["token_count"]
+                    eval_token_count = min(args.eval_tokens, split_tokens)
+                    eval_global_batch = eval_device_batch_size * args.max_seq_len * ddp_world_size
+                    eval_steps = eval_token_count // eval_global_batch
+                    if eval_steps < 1:
+                        raise RuntimeError(
+                            f"Packed validation split {split_name} is smaller than one global eval batch"
+                        )
+                    source_metrics[source["name"]] = evaluate_loss_and_bpb(
+                        model, build_val_loader(split_name), eval_steps, token_bytes
+                    )
+                weight_sum = sum(source["ratio_units"] for source in packed_manifest["sources"])
+                val_bpb = sum(
+                    source_metrics[source["name"]]["bpb"] * source["ratio_units"]
+                    for source in packed_manifest["sources"]
+                ) / weight_sum
+                val_loss = sum(
+                    source_metrics[source["name"]]["loss"] * source["ratio_units"]
+                    for source in packed_manifest["sources"]
+                ) / weight_sum
+            else:
+                val_loader = build_val_loader()
+                eval_steps = args.eval_tokens // (eval_device_batch_size * args.max_seq_len * ddp_world_size)
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+                val_loss = None
+                source_metrics = {}
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+        for source_name, metrics in source_metrics.items():
+            print0(f"  {source_name}: loss={metrics['loss']:.6f} bpb={metrics['bpb']:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        val_log = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        if val_loss is not None:
+            val_log["val/loss"] = val_loss
+        for source_name, metrics in source_metrics.items():
+            metric_name = source_name.removeprefix("Nemotron-Pretraining-").lower().replace("-", "_")
+            val_log[f"val/{metric_name}/loss"] = metrics["loss"]
+            val_log[f"val/{metric_name}/bpb"] = metrics["bpb"]
+        wandb_run.log(val_log)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -474,7 +636,9 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    periodic_save = step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0
+    explicit_save = step > 0 and step != args.resume_from_step and step in save_at_steps
+    if last_step or periodic_save or explicit_save:
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -489,6 +653,17 @@ while True:
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
                 "dataloader_state_dict": dataloader_state_dict,
+                "packed_data": None if packed_manifest is None else {
+                    "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
+                    "split": args.dataset_split,
+                    "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
+                    "global_sequence_offset": step * (total_batch_size // args.max_seq_len),
+                    "optimizer_step": step,
+                    "global_batch_sequences": total_batch_size // args.max_seq_len,
+                    "context_length": args.max_seq_len,
+                    "sampler_version": SAMPLER_VERSION,
+                    "optimizer_world_size": ddp_world_size,
+                },
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
@@ -507,6 +682,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    data_wait_time = 0.0
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -515,7 +691,11 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+        if need_next_batch:
+            data_wait_start = time.time()
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+            data_wait_time += time.time() - data_wait_start
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -552,6 +732,7 @@ while True:
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    data_wait_pct = 100 * data_wait_time / dt
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     # Calculate ETA based on average time per step (excluding first 10 steps)
@@ -563,8 +744,11 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if packed_manifest is not None:
+        epoch = f"global sequence offset: {step * (total_batch_size // args.max_seq_len):,}"
+    else:
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data wait: {data_wait_pct:.2f}% | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -575,6 +759,7 @@ while True:
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
+            "train/data_wait_pct": data_wait_pct,
             "train/epoch": epoch,
         }
         wandb_run.log(log_data)

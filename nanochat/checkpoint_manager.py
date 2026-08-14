@@ -5,6 +5,7 @@ import os
 import re
 import json
 import logging
+import math
 import torch
 
 from nanochat.common import get_base_dir
@@ -24,7 +25,7 @@ def _patch_missing_config_keys(model_config_kwargs):
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
-        log0(f"Patching missing window_pattern in model config to 'L'")
+        log0("Patching missing window_pattern in model config to 'L'")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -32,11 +33,11 @@ def _patch_missing_keys(model_data, model_config):
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
         model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
+        log0("Patching missing resid_lambdas in model data to 1.0")
     # x0_lambdas defaults to 0.0 (disabled)
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
+        log0("Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -71,6 +72,89 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
+
+
+def load_optimizer_state_resharded(
+    checkpoint_dir,
+    step,
+    optimizer,
+    old_world_size,
+    new_rank,
+    new_world_size,
+):
+    """Reconstruct and repartition nanochat's ZeRO-2 optimizer state.
+
+    Checkpoints store one optimizer shard per rank. AdamW tensor states are
+    sharded along parameter dimension zero; Muon group states are sharded along
+    the stacked parameter index. This function permits a packed-data resume at
+    a different world size while the data stream itself is recomputed from the
+    global optimizer-step offset.
+    """
+    if old_world_size < 1 or new_world_size < 1:
+        raise ValueError("World sizes must be positive")
+    shard_states = []
+    for old_rank in range(old_world_size):
+        path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{old_rank:d}.pt")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Optimizer shard required for topology change is missing: {path}")
+        shard_states.append(torch.load(path, map_location="cpu"))
+
+    saved_groups = shard_states[0]["param_groups"]
+    if len(saved_groups) != len(optimizer.param_groups):
+        raise ValueError("Optimizer group count changed across resume")
+    result = {"state": {}, "param_groups": saved_groups}
+
+    for group_index, (saved_group, live_group) in enumerate(zip(saved_groups, optimizer.param_groups)):
+        param_ids = saved_group["params"]
+        live_params = live_group["params"]
+        if len(param_ids) != len(live_params) or saved_group.get("kind") != live_group.get("kind"):
+            raise ValueError(f"Optimizer group {group_index} changed across resume")
+        kind = saved_group["kind"]
+        if kind == "adamw":
+            for param_id, parameter in zip(param_ids, live_params):
+                states = [shard["state"][param_id] for shard in shard_states]
+                rebuilt = {}
+                for key, value in states[0].items():
+                    if not torch.is_tensor(value) or value.ndim == 0:
+                        rebuilt[key] = value
+                        continue
+                    if parameter.numel() < 1024:
+                        rebuilt[key] = value  # small parameters have replicated state
+                        continue
+                    full = torch.cat([state[key] for state in states], dim=0)
+                    if tuple(full.shape) != tuple(parameter.shape):
+                        raise ValueError(
+                            f"Cannot reconstruct AdamW state for group {group_index}, parameter {param_id}: "
+                            f"{tuple(full.shape)} != {tuple(parameter.shape)}"
+                        )
+                    if parameter.shape[0] % new_world_size:
+                        raise ValueError("AdamW parameter cannot be evenly sharded at the new world size")
+                    rank_size = parameter.shape[0] // new_world_size
+                    rebuilt[key] = full[new_rank * rank_size : (new_rank + 1) * rank_size].clone()
+                result["state"][param_id] = rebuilt
+        elif kind == "muon":
+            if not param_ids:
+                continue
+            state_param_id = param_ids[0]
+            states = [shard["state"][state_param_id] for shard in shard_states]
+            rebuilt = {}
+            new_chunk_size = math.ceil(len(param_ids) / new_world_size)
+            start = new_rank * new_chunk_size
+            owned = max(0, min(new_chunk_size, len(param_ids) - start))
+            for key, value in states[0].items():
+                if not torch.is_tensor(value) or value.ndim == 0:
+                    rebuilt[key] = value
+                    continue
+                full = torch.cat([state[key] for state in states], dim=0)[: len(param_ids)]
+                output_shape = (new_chunk_size,) + tuple(full.shape[1:])
+                output = torch.zeros(output_shape, dtype=full.dtype)
+                if owned:
+                    output[:owned].copy_(full[start : start + owned])
+                rebuilt[key] = output
+            result["state"][state_param_id] = rebuilt
+        else:
+            raise ValueError(f"Unsupported optimizer group kind: {kind}")
+    return result
 
 
 def build_model(checkpoint_dir, step, device, phase):
@@ -108,7 +192,8 @@ def build_model(checkpoint_dir, step, device, phase):
     else:
         model.train()
     # Load the Tokenizer
-    tokenizer = get_tokenizer()
+    tokenizer_dir = meta_data.get("user_config", {}).get("tokenizer_dir")
+    tokenizer = get_tokenizer(tokenizer_dir)
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
     return model, tokenizer, meta_data

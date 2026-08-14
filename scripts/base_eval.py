@@ -26,14 +26,14 @@ import random
 import zipfile
 import tempfile
 import argparse
-import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb
+from nanochat.packed_data import load_manifest, packed_distributed_validation_loader
 from nanochat.engine import Engine
 
 # -----------------------------------------------------------------------------
@@ -149,7 +149,8 @@ def main():
     # Load model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
     sequence_len = meta["model_config"]["sequence_len"]
-    token_bytes = get_token_bytes(device=device)
+    tokenizer_dir = meta.get("user_config", {}).get("tokenizer_dir")
+    token_bytes = get_token_bytes(device=device, tokenizer_dir=tokenizer_dir)
     model_name = f"base_model (step {meta['step']})"
     model_slug = f"base_model_{meta['step']:06d}"
 
@@ -202,17 +203,54 @@ def main():
         print0("BPB Evaluation")
         print0("="*80)
         tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
-        if args.split_tokens % tokens_per_step != 0:
-            # Adjust to nearest multiple
-            args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
-            print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
-        steps = args.split_tokens // tokens_per_step
-
-        for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
-            bpb = evaluate_bpb(model, loader, steps, token_bytes)
-            bpb_results[split_name] = bpb
-            print0(f"{split_name} bpb: {bpb:.6f}")
+        packed_meta = meta.get("packed_data")
+        if packed_meta is not None:
+            manifest_path = meta["user_config"]["dataset_manifest"]
+            manifest = load_manifest(manifest_path)
+            if manifest["canonical_manifest_sha256"] != packed_meta["manifest_sha256"]:
+                raise RuntimeError("Evaluation manifest differs from checkpoint metadata")
+            weighted_bpb = 0.0
+            weighted_loss = 0.0
+            weight_sum = sum(source["ratio_units"] for source in manifest["sources"])
+            for source in manifest["sources"]:
+                split_name = f"validation/{source['name']}"
+                split_tokens = min(args.split_tokens, manifest["splits"][split_name]["token_count"])
+                steps = split_tokens // tokens_per_step
+                if steps < 1:
+                    raise RuntimeError(f"{split_name} is smaller than one global evaluation batch")
+                loader = packed_distributed_validation_loader(
+                    manifest_path,
+                    split_name,
+                    args.device_batch_size,
+                    sequence_len,
+                    device,
+                    rank=ddp_rank,
+                    world_size=ddp_world_size,
+                )
+                metrics = evaluate_loss_and_bpb(model, loader, steps, token_bytes)
+                bpb_results[split_name] = metrics
+                weighted_bpb += metrics["bpb"] * source["ratio_units"]
+                weighted_loss += metrics["loss"] * source["ratio_units"]
+                print0(f"{split_name}: loss={metrics['loss']:.6f} bpb={metrics['bpb']:.6f}")
+            bpb_results["weighted"] = {
+                "loss": weighted_loss / weight_sum,
+                "bpb": weighted_bpb / weight_sum,
+            }
+            print0(
+                f"weighted validation: loss={bpb_results['weighted']['loss']:.6f} "
+                f"bpb={bpb_results['weighted']['bpb']:.6f}"
+            )
+        else:
+            if args.split_tokens % tokens_per_step != 0:
+                # Adjust to nearest multiple
+                args.split_tokens = (args.split_tokens // tokens_per_step) * tokens_per_step
+                print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
+            steps = args.split_tokens // tokens_per_step
+            for split_name in ["train", "val"]:
+                loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+                bpb = evaluate_bpb(model, loader, steps, token_bytes)
+                bpb_results[split_name] = bpb
+                print0(f"{split_name} bpb: {bpb:.6f}")
 
     # --- CORE evaluation ---
     if 'core' in eval_modes:

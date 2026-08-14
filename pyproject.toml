@@ -59,6 +59,9 @@ gpu = [
     "torch==2.9.1",
 ]
 
+[project.scripts]
+prepare_nemotron = "scripts.prepare_nemotron:main"
+
 [tool.uv]
 default-groups = []
 conflicts = [

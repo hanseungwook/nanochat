@@ -83,6 +83,76 @@ A few more notes:
 - If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
 - Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
 
+### Pinned Nemotron Specialized 100B corpus
+
+This fork can build a portable, pretokenized corpus from the six subsets of
+`nvidia/Nemotron-Pretraining-Specialized-v1` at revision
+`9ed3718b5f2ae29074c5e34e64115432b7c4320f`. It uses only the published
+`karpathy/nanochat-d32` tokenizer artifacts at revision
+`016dba034c9c0ca9033ad1bc721bceff54680600`; it does not train or substitute a
+tokenizer. All bulk outputs stay outside Git:
+
+```bash
+export NANOCHAT_DATA_ROOT=/mnt/weka/shrd/k2m/seungwook.han/nanochat_data
+export NANOCHAT_BASE_DIR="$NANOCHAT_DATA_ROOT/runtime"
+
+# Small first step: download and checksum only tokenizer.pkl and token_bytes.pt.
+prepare_nemotron audit --tokenizer-only
+
+# Bulk stages. Replace the indices with the current job-array task ID. The last
+# task to finish each stage creates its aggregate completion marker.
+prepare_nemotron --job-index "$TASK_INDEX" --job-count 32 audit
+prepare_nemotron --job-index "$TASK_INDEX" --job-count 32 tokenize
+prepare_nemotron --job-index "$TASK_INDEX" --job-count 18 pack
+prepare_nemotron --job-index "$TASK_INDEX" --job-count 8 shuffle
+prepare_nemotron verify
+```
+
+`python -m scripts.prepare_nemotron` is equivalent when the console entry point
+is not installed. Every command prints resolved paths before doing work, emits a
+machine-readable status object, verifies upstream hashes, writes atomically,
+and skips already verified outputs. The CLI refuses a data root inside either
+the nanochat repository or its containing repository. Audit mirrors all 351 GB
+of pinned Parquet first and bulk stages require 800 GiB free by default.
+
+The final manifest defines `train_50b` as the independently shuffled segment 0
+(24,254,720 rows / 49,673,666,560 optimizer tokens) and `train_100b` as segment
+0 followed by segment 1 (99,347,333,120 tokens). Each row is 2,049 little-endian
+`uint16` IDs. Six fixed validation splits contain 2,048 rows each. Run
+`prepare_nemotron verify` before training; staging data should only be removed
+after that command passes.
+
+The production d10 run is one 8xH100 node, 32 rows per rank, one microstep, and
+exactly 94,745 optimizer steps:
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=10 \
+    --max-seq-len=2048 \
+    --device-batch-size=32 \
+    --eval-device-batch-size=32 \
+    --total-batch-size=524288 \
+    --dataset-manifest="$NANOCHAT_DATA_ROOT/datasets/nemotron-specialized-v1/9ed3718b5f2ae29074c5e34e64115432b7c4320f/packed/v1/manifest.json" \
+    --dataset-split=train_50b \
+    --tokenizer-dir="$NANOCHAT_DATA_ROOT/tokenizers/nanochat-d32/016dba034c9c0ca9033ad1bc721bceff54680600" \
+    --save-at-steps=1908,19073 \
+    --run=nemotron-specialized-d10
+```
+
+Packed training requires Flash Attention 3 on CUDA. Checkpoints record the
+manifest, tokenizer, split, sampler, global sequence offset, and global batch;
+resumes reject incompatible inputs. Rank ownership is recomputed from the
+global step, so an 8-GPU and 16-GPU compatibility run consume the same 256
+sequence IDs per optimizer step (use device batch 16 on 16 GPUs). The loader
+reports `train/data_wait_pct`; only pass a node-local
+`--data-cache-dir="$SLURM_TMPDIR/nanochat_data_cache"` if sustained wait exceeds
+5%, and let Slurm remove that directory with the job allocation.
+
+Validation logs source-specific loss/BPB plus a 1,346:825:251:194:79:12
+weighted aggregate. Packed shards and trained weights must not be redistributed
+until the Wiki-Rewrite, Scientific-Coding, underlying-source, and generator
+model license requirements have been reviewed.
+
 ## Research
 
 If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:

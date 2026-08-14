@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_loss_and_bpb(model, batches, steps, token_bytes):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -27,6 +27,8 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     # record the losses
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
+    total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
@@ -46,20 +48,34 @@ def evaluate_bpb(model, batches, steps, token_bytes):
             )
             total_nats += (loss2d * (num_bytes2d > 0)).sum()
             total_bytes += num_bytes2d.sum()
+            total_loss += loss2d[valid].sum()
+            total_tokens += valid.sum()
         else:
             # fast path: no ignored targets, safe to index directly
             num_bytes2d = token_bytes[y]
             total_nats += (loss2d * (num_bytes2d > 0)).sum()
             total_bytes += num_bytes2d.sum()
+            total_loss += loss2d.sum()
+            total_tokens += y.numel()
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
     # move both to cpu, calculate bpb and return
     total_nats = total_nats.item()
     total_bytes = total_bytes.item()
+    total_loss = total_loss.item()
+    total_tokens = total_tokens.item()
     if total_bytes == 0:
-        return float('inf')
+        return {"loss": float("inf"), "bpb": float("inf")}
     bpb = total_nats / (math.log(2) * total_bytes)
-    return bpb
+    return {"loss": total_loss / max(1, total_tokens), "bpb": bpb}
+
+
+@torch.no_grad()
+def evaluate_bpb(model, batches, steps, token_bytes):
+    """Backward-compatible BPB-only wrapper."""
+    return evaluate_loss_and_bpb(model, batches, steps, token_bytes)["bpb"]
