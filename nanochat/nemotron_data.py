@@ -294,7 +294,7 @@ def fetch_dataset_inventory(layout: DataLayout) -> list[dict]:
             }
         )
     files.sort(key=lambda item: item["path"])
-    if len(files) != 330 or sum(item["size_bytes"] for item in files) != 350_922_849_626:
+    if len(files) != 330 or sum(item["size_bytes"] for item in files) != 350_922_825_780:
         raise RuntimeError("Pinned dataset inventory count or byte size changed unexpectedly")
     inventory = {
         "repository": DATASET_REPOSITORY,
