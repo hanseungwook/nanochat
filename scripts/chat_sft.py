@@ -120,6 +120,9 @@ if model.config.mtp_n > 1:
     # while retaining the auxiliary weights for strict checkpoint round trips.
     orig_model.freeze_mtp_aux_parameters()
     print0(f"Freezing MTP heads 2..{model.config.mtp_n} for next-token SFT")
+if model.config.rsm:
+    orig_model.freeze_rsm_parameters()
+    print0("Freezing the training-only RSM head for next-token SFT")
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops(mtp_training=False)
@@ -147,11 +150,11 @@ optimizer = model.setup_optimizer(
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
-if args.load_optimizer and model.config.mtp_n > 1:
+if args.load_optimizer and (model.config.mtp_n > 1 or model.config.rsm):
     # The base optimizer contains all MTP heads, whereas this head-1-only
     # optimizer intentionally does not. Their parameter groups are therefore
     # not state-dict compatible.
-    print0("Skipping base optimizer warm-start for an MTP checkpoint (auxiliary heads are frozen)")
+    print0("Skipping base optimizer warm-start because pretraining-only parameters are frozen")
 elif args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
@@ -406,7 +409,10 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        default_model_tag = f"d{depth}" if model.config.mtp_n == 1 else f"d{depth}-mtp{model.config.mtp_n}"
+        if model.config.rsm:
+            default_model_tag = f"d{depth}-rsm"
+        else:
+            default_model_tag = f"d{depth}" if model.config.mtp_n == 1 else f"d{depth}-mtp{model.config.mtp_n}"
         output_dirname = args.model_tag if args.model_tag else default_model_tag
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
@@ -426,7 +432,11 @@ while True:
                     "n_embd": model.config.n_embd,
                     "mtp_n": model.config.mtp_n,
                     "window_pattern": model.config.window_pattern,
+                    "rsm": model.config.rsm,
+                    "rsm_max_horizon": model.config.rsm_max_horizon,
+                    "rsm_seed": model.config.rsm_seed,
                 },
+                "rsm_config": meta.get("rsm_config"),
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
