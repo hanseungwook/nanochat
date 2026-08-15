@@ -139,6 +139,26 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
     --run=nemotron-specialized-d10
 ```
 
+To run the matched regular autoregressive and FAIR/Meta MTP-4 baselines on
+that same split, use the paired launcher after `prepare_nemotron verify`
+succeeds:
+
+```bash
+# Run these as separate jobs to train concurrently, or use `both` sequentially.
+bash runs/nemotron_mtp_baselines.sh ar
+bash runs/nemotron_mtp_baselines.sh mtp
+```
+
+Both arms use depth 10 as the fixed total Transformer-block/parameter budget,
+the same shuffled examples, 49,673,666,560 optimizer tokens, global token
+batch, tokenizer, schedule, validation, and checkpoint milestones. MTP assigns
+four of those blocks to independent future-token heads and averages their four
+equal-weight losses before backward. This is an equal-parameter and equal-data
+comparison; MTP performs three additional shared-unembedding passes, so it is
+not an equal-FLOP or equal-wall-clock comparison. Set `DRY_RUN=1` to inspect
+the commands, and use environment variables documented at the top of the
+launcher to override cluster-specific defaults.
+
 Packed training requires Flash Attention 3 on CUDA. Checkpoints record the
 manifest, tokenizer, split, sampler, global sequence offset, and global batch;
 resumes reject incompatible inputs. Rank ownership is recomputed from the
