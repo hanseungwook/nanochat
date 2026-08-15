@@ -40,7 +40,7 @@ from nanochat.packed_data import (
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, load_optimizer_state_resharded
-from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb
+from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb_by_source
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -54,7 +54,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 data_root = os.environ.get("NANOCHAT_DATA_ROOT")
-default_manifest = os.path.join(data_root, "datasets", "nemotron-specialized-v1", "9ed3718b5f2ae29074c5e34e64115432b7c4320f", "packed", "v1", "manifest.json") if data_root else None
+default_manifest = os.path.join(data_root, "datasets", "nemotron-specialized-v1", "9ed3718b5f2ae29074c5e34e64115432b7c4320f", "recipes", "ratio-validation-v2", "packed", "v1", "manifest.json") if data_root else None
 default_tokenizer_dir = os.path.join(data_root, "tokenizers", "nanochat-d32", "016dba034c9c0ca9033ad1bc721bceff54680600") if data_root else None
 parser.add_argument("--dataset-manifest", type=str, default=default_manifest, help="packed dataset manifest (unset preserves the ClimbMix loader)")
 parser.add_argument("--dataset-split", type=str, default="train_50b", choices=["train_50b", "train_100b"], help="named packed training split")
@@ -505,15 +505,16 @@ if packed_manifest is not None:
         world_size=ddp_world_size,
         data_cache_dir=args.data_cache_dir,
     )
-    build_val_loader = lambda split_name: packed_distributed_validation_loader(
+    build_val_loader = lambda: packed_distributed_validation_loader(
         args.dataset_manifest,
-        split_name,
+        "validation",
         eval_device_batch_size,
         args.max_seq_len,
         device,
         rank=ddp_rank,
         world_size=ddp_world_size,
         data_cache_dir=args.data_cache_dir,
+        return_source_ids=True,
     )
 else:
     dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
@@ -614,29 +615,26 @@ while True:
         model.eval()
         with disable_fp8(model):
             if packed_manifest is not None:
-                source_metrics = {}
-                for source in packed_manifest["sources"]:
-                    split_name = f"validation/{source['name']}"
-                    split_tokens = packed_manifest["splits"][split_name]["token_count"]
-                    eval_token_count = min(args.eval_tokens, split_tokens)
-                    eval_global_batch = eval_device_batch_size * args.max_seq_len * ddp_world_size
-                    eval_steps = eval_token_count // eval_global_batch
-                    if eval_steps < 1:
-                        raise RuntimeError(
-                            f"Packed validation split {split_name} is smaller than one global eval batch"
-                        )
-                    source_metrics[source["name"]] = evaluate_loss_and_bpb(
-                        model, build_val_loader(split_name), eval_steps, token_bytes
+                split = packed_manifest["splits"]["validation"]
+                eval_global_batch = eval_device_batch_size * args.max_seq_len * ddp_world_size
+                if split["token_count"] % eval_global_batch:
+                    raise RuntimeError(
+                        "The full packed validation set must be divisible by the global eval batch"
                     )
-                weight_sum = sum(source["ratio_units"] for source in packed_manifest["sources"])
-                val_bpb = sum(
-                    source_metrics[source["name"]]["bpb"] * source["ratio_units"]
+                eval_steps = split["token_count"] // eval_global_batch
+                metrics = evaluate_loss_and_bpb_by_source(
+                    model,
+                    build_val_loader(),
+                    eval_steps,
+                    token_bytes,
+                    num_sources=len(packed_manifest["sources"]),
+                )
+                val_bpb = metrics["aggregate"]["bpb"]
+                val_loss = metrics["aggregate"]["loss"]
+                source_metrics = {
+                    source["name"]: metrics["per_source"][source["source_id"]]
                     for source in packed_manifest["sources"]
-                ) / weight_sum
-                val_loss = sum(
-                    source_metrics[source["name"]]["loss"] * source["ratio_units"]
-                    for source in packed_manifest["sources"]
-                ) / weight_sum
+                }
             else:
                 val_loader = build_val_loader()
                 eval_steps = args.eval_tokens // (eval_device_batch_size * args.max_seq_len * ddp_world_size)

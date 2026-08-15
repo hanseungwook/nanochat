@@ -144,6 +144,35 @@ def validate_manifest(manifest: dict, verify_hash: bool = True) -> None:
             raise ManifestError(
                 f"Split {split_name!r} token_count must be {expected_tokens}"
             )
+        per_source = split.get("per_source")
+        if per_source is not None:
+            offset = 0
+            seen_source_ids = set()
+            for source_name, source in sorted(
+                per_source.items(), key=lambda item: item[1].get("start_sequence", -1)
+            ):
+                if source.get("start_sequence") != offset:
+                    raise ManifestError(
+                        f"Split {split_name!r} source {source_name!r} has a non-contiguous range"
+                    )
+                count = source.get("sequence_count")
+                if not isinstance(count, int) or count <= 0:
+                    raise ManifestError(
+                        f"Split {split_name!r} source {source_name!r} has an invalid sequence count"
+                    )
+                if source.get("token_count") != count * context_length:
+                    raise ManifestError(
+                        f"Split {split_name!r} source {source_name!r} token count is inconsistent"
+                    )
+                source_id = source.get("source_id")
+                if not isinstance(source_id, int) or source_id < 0 or source_id in seen_source_ids:
+                    raise ManifestError(
+                        f"Split {split_name!r} source {source_name!r} has an invalid source ID"
+                    )
+                seen_source_ids.add(source_id)
+                offset += count
+            if offset != expected:
+                raise ManifestError(f"Split {split_name!r} per-source ranges are inconsistent")
 
     for entry in _all_file_entries(manifest):
         if entry["path"].endswith(".source.bin"):
@@ -480,9 +509,25 @@ def packed_distributed_validation_loader(
     rank: int = 0,
     world_size: int = 1,
     data_cache_dir: os.PathLike[str] | str | None = None,
-) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    return_source_ids: bool = False,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Yield a fixed validation order, cycling only after the split is exhausted."""
     manifest = load_manifest(manifest_path)
+    split = manifest["splits"].get(split_name)
+    if split is None:
+        raise ManifestError(f"Unknown validation split {split_name!r}")
+    source_ends = None
+    source_ids = None
+    if return_source_ids:
+        per_source = split.get("per_source")
+        if not per_source:
+            raise ManifestError(f"Validation split {split_name!r} has no per-source ranges")
+        ordered = sorted(per_source.values(), key=lambda item: item["start_sequence"])
+        source_ends = np.asarray(
+            [item["start_sequence"] + item["sequence_count"] for item in ordered],
+            dtype=np.int64,
+        )
+        source_ids = np.asarray([item["source_id"] for item in ordered], dtype=np.int64)
     reader = PackedShardReader(
         manifest_path,
         resolve_split_shards(manifest, split_name),
@@ -501,5 +546,14 @@ def packed_distributed_validation_loader(
         rank_start = global_offset + rank * device_batch_size
         rows = torch.from_numpy(reader.read_contiguous(rank_start, device_batch_size).astype(np.int64))
         rows = rows.to(device=device, non_blocking=device.type == "cuda")
-        yield rows[:, :-1], rows[:, 1:]
+        x, y = rows[:, :-1], rows[:, 1:]
+        if return_source_ids:
+            global_indices = np.arange(rank_start, rank_start + device_batch_size, dtype=np.int64)
+            source_positions = np.searchsorted(source_ends, global_indices, side="right")
+            batch_source_ids = torch.from_numpy(source_ids[source_positions].copy()).to(
+                device=device, non_blocking=device.type == "cuda"
+            )
+            yield x, y, batch_source_ids
+        else:
+            yield x, y
         global_offset = (global_offset + global_batch) % reader.row_count

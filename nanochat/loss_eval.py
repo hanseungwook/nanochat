@@ -76,6 +76,58 @@ def evaluate_loss_and_bpb(model, batches, steps, token_bytes):
 
 
 @torch.no_grad()
+def evaluate_loss_and_bpb_by_source(model, batches, steps, token_bytes, num_sources):
+    """Evaluate one mixed stream and retain exact per-source sufficient statistics."""
+    device = model.get_device()
+    source_nats = torch.zeros(num_sources, dtype=torch.float64, device=device)
+    source_bytes = torch.zeros(num_sources, dtype=torch.int64, device=device)
+    source_loss = torch.zeros(num_sources, dtype=torch.float64, device=device)
+    source_tokens = torch.zeros(num_sources, dtype=torch.int64, device=device)
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y, source_ids = next(batch_iter)
+        loss2d = model(x, y, loss_reduction="none")
+        valid = y >= 0
+        y_safe = torch.where(valid, y, torch.zeros_like(y))
+        num_bytes2d = torch.where(
+            valid,
+            token_bytes[y_safe],
+            torch.zeros_like(y, dtype=token_bytes.dtype),
+        )
+        row_nats = (loss2d * (num_bytes2d > 0)).sum(dim=1).double()
+        row_bytes = num_bytes2d.sum(dim=1).long()
+        row_loss = (loss2d * valid).sum(dim=1).double()
+        row_tokens = valid.sum(dim=1).long()
+        source_nats.scatter_add_(0, source_ids, row_nats)
+        source_bytes.scatter_add_(0, source_ids, row_bytes)
+        source_loss.scatter_add_(0, source_ids, row_loss)
+        source_tokens.scatter_add_(0, source_ids, row_tokens)
+
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        for tensor in (source_nats, source_bytes, source_loss, source_tokens):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    def metrics(nats, byte_count, loss, token_count):
+        if byte_count == 0:
+            return {"loss": float("inf"), "bpb": float("inf")}
+        return {
+            "loss": loss / max(1, token_count),
+            "bpb": nats / (math.log(2) * byte_count),
+        }
+
+    nats = source_nats.cpu().tolist()
+    byte_counts = source_bytes.cpu().tolist()
+    losses = source_loss.cpu().tolist()
+    token_counts = source_tokens.cpu().tolist()
+    per_source = [
+        metrics(nats[index], byte_counts[index], losses[index], token_counts[index])
+        for index in range(num_sources)
+    ]
+    aggregate = metrics(sum(nats), sum(byte_counts), sum(losses), sum(token_counts))
+    return {"aggregate": aggregate, "per_source": per_source}
+
+
+@torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
     """Backward-compatible BPB-only wrapper."""
     return evaluate_loss_and_bpb(model, batches, steps, token_bytes)["bpb"]

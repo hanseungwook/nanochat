@@ -37,10 +37,12 @@ export NANOCHAT_DATA_ROOT=${NANOCHAT_DATA_ROOT:-/mnt/weka/shrd/k2m/seungwook.han
 export NANOCHAT_BASE_DIR=${NANOCHAT_BASE_DIR:-$NANOCHAT_DATA_ROOT/runtime}
 
 dataset_revision=9ed3718b5f2ae29074c5e34e64115432b7c4320f
+preprocessing_recipe=ratio-validation-v2
 tokenizer_revision=016dba034c9c0ca9033ad1bc721bceff54680600
 dataset_root="$NANOCHAT_DATA_ROOT/datasets/nemotron-specialized-v1/$dataset_revision"
-manifest="$dataset_root/packed/v1/manifest.json"
-verify_marker="$dataset_root/staging/status/verify/complete.json"
+recipe_root="$dataset_root/recipes/$preprocessing_recipe"
+manifest="$recipe_root/packed/v1/manifest.json"
+verify_marker="$recipe_root/staging/status/verify/complete.json"
 tokenizer_dir="$NANOCHAT_DATA_ROOT/tokenizers/nanochat-d32/$tokenizer_revision"
 
 dry_run=${DRY_RUN:-0}
