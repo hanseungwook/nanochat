@@ -193,7 +193,15 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        # Newer GPTs expose the number of layers on their inference path because
+        # FAIR MTP auxiliary heads are training-only. Keep duck-typed test and
+        # third-party models compatible by falling back to the config depth.
+        num_kv_layers = self.model.get_num_kv_layers() if hasattr(self.model, "get_num_kv_layers") else m.n_layer
+        kv_model_kwargs = {
+            "num_heads": m.n_kv_head,
+            "head_dim": m.n_embd // m.n_head,
+            "num_layers": num_kv_layers,
+        }
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),

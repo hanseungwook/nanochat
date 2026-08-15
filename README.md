@@ -175,6 +175,26 @@ This uses wandb (run name "d12"), only runs the CORE metric on last step, and it
 
 See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
 
+### FAIR multi-token prediction baseline
+
+Pass `--mtp-n=4` to pretrain with the independent-head multi-token objective
+from [Gloeckle et al. (2024)](https://arxiv.org/abs/2404.19737):
+
+```bash
+OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=12 --mtp-n=4 --run="d12-mtp4" --model-tag="d12-mtp4"
+```
+
+At fixed `--depth`, the implementation keeps the total number of Transformer
+blocks and trainable parameters equal to the ordinary `--mtp-n=1` model. It
+uses a shared trunk, four independent one-layer prediction heads, and one
+shared unembedding. The four losses are backpropagated sequentially to avoid
+holding four vocabulary-logit tensors at once; their boundary gradients are
+accumulated before backpropagating through the shared trunk once. Validation,
+SFT, RL, and normal generation use only the `t+1` head. See
+[the implementation plan](dev/META_MTP_PLAN.md) for the exact baseline and
+comparison protocol.
+
 The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
 
 ## Running on CPU / MPS

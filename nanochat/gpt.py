@@ -33,6 +33,10 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # Number of independent FAIR/Meta multi-token prediction heads. `n_layer`
+    # remains the total unique Transformer-block budget. mtp_n=1 is the
+    # ordinary next-token architecture and preserves legacy checkpoint keys.
+    mtp_n: int = 1
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -65,7 +69,7 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_value_embed=None):
         super().__init__()
         self.layer_idx = layer_idx
         self.n_head = config.n_head
@@ -79,7 +83,8 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        use_value_embed = has_ve(layer_idx, config.n_layer) if use_value_embed is None else use_value_embed
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if use_value_embed else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -110,6 +115,7 @@ class CausalSelfAttention(nn.Module):
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
+            assert self.layer_idx >= 0, "Auxiliary MTP heads do not support KV-cache inference"
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
@@ -142,15 +148,56 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_value_embed=None):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config, layer_idx, use_value_embed=use_value_embed)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
+
+
+def build_mtp_targets(targets, head_idx):
+    """Shift next-token targets for a zero-based MTP head and mask the tail."""
+    assert targets.ndim == 2
+    assert 0 <= head_idx < targets.size(1), "MTP offset must fit in the sequence"
+    if head_idx == 0:
+        return targets
+    ignored_tail = targets.new_full((targets.size(0), head_idx), -1)
+    return torch.cat((targets[:, head_idx:], ignored_tail), dim=1)
+
+
+def detach_mtp_head_state(trunk_state):
+    """Detach head inputs so their gradients accumulate at the trunk boundary.
+
+    FAIR's memory-efficient schedule backpropagates each head independently,
+    accumulates gradients on the shared trunk outputs, and then traverses the
+    trunk graph once. The first three entries are the differentiable boundary;
+    rotary tensors and token ids remain shared read-only inputs.
+    """
+    x, x0, x_backout, cos_sin, idx = trunk_state
+
+    def detached_leaf(tensor):
+        if tensor is None:
+            return None
+        return tensor.detach().requires_grad_(tensor.requires_grad)
+
+    return detached_leaf(x), detached_leaf(x0), detached_leaf(x_backout), cos_sin, idx
+
+
+def backward_mtp_trunk(trunk_state, head_state):
+    """Propagate accumulated boundary gradients through the shared trunk once."""
+    trunk_outputs = []
+    boundary_grads = []
+    for trunk_tensor, head_tensor in zip(trunk_state[:3], head_state[:3]):
+        if trunk_tensor is not None and trunk_tensor.requires_grad:
+            assert head_tensor is not None and head_tensor.grad is not None, "Missing MTP trunk-boundary gradient"
+            trunk_outputs.append(trunk_tensor)
+            boundary_grads.append(head_tensor.grad)
+    assert trunk_outputs, "MTP trunk has no differentiable outputs"
+    torch.autograd.backward(trunk_outputs, grad_tensors=boundary_grads)
 
 
 class GPT(nn.Module):
@@ -162,6 +209,15 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        assert 1 <= config.mtp_n <= config.n_layer, "mtp_n must be in [1, n_layer]"
+        if config.mtp_n > 1:
+            assert config.mtp_n < config.n_layer, "MTP needs at least one shared trunk layer"
+        self.mtp_n = config.mtp_n
+        self.num_shared_layers = config.n_layer - config.mtp_n
+        self.num_inference_layers = self.num_shared_layers + 1
+        self.primary_head_slot = config.n_layer - 1
+        self.aux_head_slots = list(range(self.num_shared_layers, self.primary_head_slot))
+        assert len(self.aux_head_slots) == config.mtp_n - 1
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -170,10 +226,32 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        # Construct the embedding before the blocks to preserve the legacy n=1
+        # RNG consumption order even when a model is initialized directly on
+        # CPU instead of through Nanochat's usual meta-device path.
+        token_embedding = nn.Embedding(padded_vocab_size, config.n_embd)
+        # The ordinary path stores the shared trunk followed by head 1. With
+        # mtp_n=1 this is byte-for-byte the legacy `transformer.h` layout.
+        primary_path_blocks = [
+            Block(config, layer_idx, use_value_embed=has_ve(layer_idx, config.n_layer))
+            for layer_idx in range(self.num_shared_layers)
+        ]
+        primary_path_blocks.append(Block(
+            config,
+            self.num_inference_layers - 1,
+            use_value_embed=has_ve(self.primary_head_slot, config.n_layer),
+        ))
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "wte": token_embedding,
+            "h": nn.ModuleList(primary_path_blocks),
         })
+        # Heads 2..n branch from the same shared representation. Their
+        # layer_idx is -1 because they are training-only and never own KV cache.
+        self.mtp_heads = nn.ModuleList([
+            Block(config, -1, use_value_embed=has_ve(logical_slot, config.n_layer))
+            for logical_slot in self.aux_head_slots
+        ])
+        assert len(self.transformer.h) + len(self.mtp_heads) == config.n_layer
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -200,6 +278,10 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
+    def _all_blocks(self):
+        """All unique Transformer blocks in stable optimizer/init order."""
+        return (*self.transformer.h, *self.mtp_heads)
+
     @torch.no_grad()
     def init_weights(self):
         """
@@ -223,7 +305,7 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        for block in self._all_blocks():
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -250,7 +332,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
-        for block in self.transformer.h:
+        for block in self._all_blocks():
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
@@ -316,7 +398,20 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def estimate_flops(self):
+    def get_num_kv_layers(self):
+        """Number of Transformer layers on the ordinary head-1 inference path."""
+        return self.num_inference_layers
+
+    def _inference_window_sizes(self):
+        """Sliding windows for the shared trunk followed by primary head 1."""
+        return self.window_sizes[:self.num_shared_layers] + [self.window_sizes[self.primary_head_slot]]
+
+    def _training_window_sizes(self):
+        """Sliding windows for one training pass through every unique block."""
+        full_window = (self.config.sequence_len, 0)
+        return self.window_sizes[:self.num_shared_layers] + [full_window] * self.mtp_n
+
+    def estimate_flops(self, mtp_training=True):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
@@ -331,11 +426,20 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
+        windows = self._training_window_sizes() if mtp_training else self._inference_window_sizes()
+        for window_size in windows:
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        if mtp_training:
+            # Every unique block runs once, but the one shared unembedding runs
+            # once per independent MTP head.
+            extra_unembedding_flops = 6 * (self.mtp_n - 1) * self.lm_head.weight.numel()
+            matmul_flops = 6 * self.num_matmul_params() + extra_unembedding_flops
+        else:
+            # Next-token finetuning uses only the ordinary trunk + head-1 path.
+            matmul_flops = 6 * self.num_inference_matmul_params()
+        num_flops_per_token = matmul_flops + attn_flops
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -348,6 +452,16 @@ class GPT(nn.Module):
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
         return matmul_params
 
+    def num_inference_matmul_params(self):
+        """Matmul parameters used by the shared trunk and primary head only."""
+        active_roots = (self.transformer, self.lm_head, self.smear_gate)
+        return sum(
+            m.weight.numel()
+            for root in active_roots
+            for m in root.modules()
+            if isinstance(m, Linear)
+        )
+
     def estimate_decode_flops(self, context_len):
         """
         Forward FLOPs to decode one token at a given context length during inference:
@@ -355,8 +469,8 @@ class GPT(nn.Module):
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
-        decode_flops = 2 * self.num_matmul_params() + attn_flops
+        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self._inference_window_sizes())
+        decode_flops = 2 * self.num_inference_matmul_params() + attn_flops
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
@@ -364,18 +478,18 @@ class GPT(nn.Module):
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = 0
-        for window, _ in self.window_sizes:
+        for window, _ in self._inference_window_sizes():
             w = min(window, num_tokens)
             attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
             attn_flops += 4 * h * q * attended_tokens
-        prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
+        prefill_flops = 2 * self.num_inference_matmul_params() * num_tokens + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
         """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        return self.num_inference_layers * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
         """Bytes of KV cache *read* by one decode step at a given context length, per row.
@@ -383,7 +497,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
-        for window, _ in self.window_sizes:
+        for window, _ in self._inference_window_sizes():
             total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
         return total
 
@@ -403,7 +517,7 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        transformer_matrices = sum(p.numel() for block in self._all_blocks() for p in block.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -416,18 +530,53 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def mtp_aux_parameters(self):
+        """Yield parameters used exclusively by auxiliary MTP heads."""
+        yield from self.mtp_heads.parameters()
+        for logical_slot in self.aux_head_slots:
+            slot = str(logical_slot)
+            if slot in self.value_embeds:
+                yield from self.value_embeds[slot].parameters()
+
+    def freeze_mtp_aux_parameters(self):
+        """Freeze training-only heads while retaining them for strict checkpoints."""
+        for param in self.mtp_aux_parameters():
+            param.requires_grad_(False)
+
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        scalar_lr=0.5,
+        include_mtp_aux=True,
+    ):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
+        active_blocks = self._all_blocks() if include_mtp_aux else tuple(self.transformer.h)
+        matrix_params = [p for block in active_blocks for p in block.parameters()]
+        if include_mtp_aux:
+            value_embeds_params = list(self.value_embeds.parameters())
+        else:
+            active_slots = (*range(self.num_shared_layers), self.primary_head_slot)
+            value_embeds_params = [
+                param
+                for logical_slot in active_slots
+                if str(logical_slot) in self.value_embeds
+                for param in self.value_embeds[str(logical_slot)].parameters()
+            ]
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        optimizer_params = matrix_params + embedding_params + lm_head_params + value_embeds_params + resid_params + x0_params + smear_params
+        assert len(optimizer_params) == len({id(param) for param in optimizer_params}), "Optimizer parameter appears in multiple groups"
+        aux_param_ids = {id(param) for param in self.mtp_aux_parameters()}
+        expected_params = [param for param in self.parameters() if include_mtp_aux or id(param) not in aux_param_ids]
+        assert {id(param) for param in optimizer_params} == {id(param) for param in expected_params}, "Optimizer parameter coverage mismatch"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -456,7 +605,15 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _backout_layer(self):
+        """Logical shared layer whose activation is removed before each head."""
+        original_layer = self.config.n_layer // 2
+        if self.mtp_n == 1:
+            return original_layer
+        return min(original_layer, self.num_shared_layers - 1)
+
+    def forward_mtp_trunk(self, idx, kv_cache=None):
+        """Run embeddings and the trunk shared by every independent MTP head."""
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -491,17 +648,48 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Forward the trunk of the Transformer
+        # Forward only the Transformer layers shared by all prediction heads.
         x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        backout_layer = self._backout_layer()
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
+        for i, block in enumerate(self.transformer.h[:-1]):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
+
+        # A plain tuple keeps the boundary friendly to torch.compile.
+        return x, x0, x_backout, cos_sin, idx
+
+    def forward_mtp_head(self, trunk_state, targets=None, head_idx=0, kv_cache=None, loss_reduction='mean'):
+        """Run one independent FAIR/Meta prediction head and the shared lm_head.
+
+        `head_idx` is zero-based: 0 predicts t+1, 1 predicts t+2, etc.
+        Auxiliary heads are training-only and never consume another head's
+        output or future-token embeddings.
+        """
+        assert 0 <= head_idx < self.mtp_n
+        x, x0, x_backout, cos_sin, idx = trunk_state
+        if head_idx == 0:
+            block = self.transformer.h[-1]
+            logical_slot = self.primary_head_slot
+        else:
+            assert len(self.mtp_heads) == self.mtp_n - 1, "Auxiliary MTP heads were dropped for inference"
+            assert kv_cache is None, "Auxiliary MTP heads do not support KV-cache inference"
+            block = self.mtp_heads[head_idx - 1]
+            logical_slot = self.aux_head_slots[head_idx - 1]
+
+        # Every head starts from the exact same shared trunk representation.
+        x = self.resid_lambdas[logical_slot] * x + self.x0_lambdas[logical_slot] * x0
+        ve = self.value_embeds[str(logical_slot)](idx).to(x.dtype) if str(logical_slot) in self.value_embeds else None
+        full_window = (self.config.sequence_len, 0)
+        x = block(x, ve, cos_sin, full_window, kv_cache)
+
+        # Preserve exact n=1 behavior for very shallow models whose historical
+        # backout point is the final layer itself.
+        if x_backout is None and logical_slot == self._backout_layer():
+            x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
@@ -517,11 +705,31 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
+            targets = build_mtp_targets(targets, head_idx)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly
             return logits
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        """Backward-compatible ordinary next-token forward using MTP head 1."""
+        trunk_state = self.forward_mtp_trunk(idx, kv_cache=kv_cache)
+        return self.forward_mtp_head(
+            trunk_state,
+            targets=targets,
+            head_idx=0,
+            kv_cache=kv_cache,
+            loss_reduction=loss_reduction,
+        )
+
+    def drop_mtp_aux_heads(self):
+        """Release heads 2..n and their value embeddings for head-1 inference."""
+        self.mtp_heads = nn.ModuleList()
+        for logical_slot in self.aux_head_slots:
+            slot = str(logical_slot)
+            if slot in self.value_embeds:
+                del self.value_embeds[slot]
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

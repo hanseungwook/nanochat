@@ -115,9 +115,14 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
+if model.config.mtp_n > 1:
+    # FAIR MTP is a pretraining objective. SFT continues through head 1 only,
+    # while retaining the auxiliary weights for strict checkpoint round trips.
+    orig_model.freeze_mtp_aux_parameters()
+    print0(f"Freezing MTP heads 2..{model.config.mtp_n} for next-token SFT")
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = model.estimate_flops(mtp_training=False)
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
 assert args.total_batch_size % world_tokens_per_fwdbwd == 0, f"total_batch_size ({args.total_batch_size}) must be a multiple of {world_tokens_per_fwdbwd}."
@@ -129,14 +134,25 @@ token_bytes = get_token_bytes(device=device, tokenizer_dir=pretrain_user_config.
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(
+    unembedding_lr=args.unembedding_lr,
+    embedding_lr=args.embedding_lr,
+    matrix_lr=args.matrix_lr,
+    weight_decay=0.0,
+    include_mtp_aux=False,
+)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
-if args.load_optimizer:
+if args.load_optimizer and model.config.mtp_n > 1:
+    # The base optimizer contains all MTP heads, whereas this head-1-only
+    # optimizer intentionally does not. Their parameter groups are therefore
+    # not state-dict compatible.
+    print0("Skipping base optimizer warm-start for an MTP checkpoint (auxiliary heads are frozen)")
+elif args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -390,7 +406,8 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+        default_model_tag = f"d{depth}" if model.config.mtp_n == 1 else f"d{depth}-mtp{model.config.mtp_n}"
+        output_dirname = args.model_tag if args.model_tag else default_model_tag
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -407,6 +424,7 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "mtp_n": model.config.mtp_n,
                     "window_pattern": model.config.window_pattern,
                 },
                 "user_config": user_config, # inputs to the training script

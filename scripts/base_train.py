@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, detach_mtp_head_state, backward_mtp_trunk
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.packed_data import (
     SAMPLER_VERSION,
@@ -68,6 +68,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--mtp-n", type=int, default=1, help="number of independent FAIR/Meta prediction heads (1 disables MTP; use 4 for the baseline)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -179,7 +180,8 @@ print0(f"Vocab size: {vocab_size:,}")
 # Resolve checkpoint metadata before model allocation so incompatible packed-data
 # resumes fail without spending GPU memory.
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
+default_model_tag = f"d{args.depth}" if args.mtp_n == 1 else f"d{args.depth}-mtp{args.mtp_n}"
+output_dirname = args.model_tag if args.model_tag else default_model_tag
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 resume_meta = None
@@ -187,6 +189,10 @@ if resuming:
     meta_path = os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         resume_meta = json.load(f)
+    checkpoint_config = resume_meta["model_config"]
+    checkpoint_mtp_n = checkpoint_config.get("mtp_n", 1)
+    assert checkpoint_mtp_n == args.mtp_n, f"Checkpoint mtp_n={checkpoint_mtp_n} does not match --mtp-n={args.mtp_n}"
+    assert checkpoint_config["n_layer"] == args.depth, f"Checkpoint depth={checkpoint_config['n_layer']} does not match --depth={args.depth}"
     if packed_manifest is not None:
         expected_packed = {
             "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
@@ -222,6 +228,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        mtp_n=args.mtp_n,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
@@ -332,6 +339,21 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+
+# FAIR/Meta MTP needs one shared trunk forward followed by separately
+# backpropagated heads. Compile each static entry point so the head index never
+# becomes a dynamic graph input.
+mtp_trunk_forward = None
+mtp_head_forwards = []
+if args.mtp_n > 1:
+    mtp_trunk_forward = torch.compile(orig_model.forward_mtp_trunk, dynamic=False)
+
+    def make_mtp_head_forward(head_idx):
+        def mtp_head_forward(trunk_state, targets):
+            return orig_model.forward_mtp_head(trunk_state, targets=targets, head_idx=head_idx)
+        return torch.compile(mtp_head_forward, dynamic=False)
+
+    mtp_head_forwards = [make_mtp_head_forward(head_idx) for head_idx in range(args.mtp_n)]
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -683,19 +705,46 @@ while True:
     synchronize()
     t0 = time.time()
     data_wait_time = 0.0
-    for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
-        if need_next_batch:
-            data_wait_start = time.time()
-            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-            data_wait_time += time.time() - data_wait_start
+    if args.mtp_n == 1:
+        for micro_step in range(grad_accum_steps):
+            loss = model(x, y)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            if need_next_batch:
+                data_wait_start = time.time()
+                x, y, dataloader_state_dict = next(train_loader)
+                data_wait_time += time.time() - data_wait_start
+        train_head_losses = [train_loss]
+    else:
+        # Materialize and backpropagate only one vocabulary-logit tensor at a
+        # time. Each head accumulates gradients on detached trunk-boundary
+        # tensors; after all heads finish, traverse the shared trunk once.
+        train_head_losses = [torch.zeros((), device=device) for _ in range(args.mtp_n)]
+        for micro_step in range(grad_accum_steps):
+            trunk_state = mtp_trunk_forward(x)
+            head_state = detach_mtp_head_state(trunk_state)
+            for head_idx, mtp_head_forward in enumerate(mtp_head_forwards):
+                head_loss = mtp_head_forward(head_state, y)
+                train_head_losses[head_idx] += head_loss.detach() / grad_accum_steps
+                scaled_head_loss = head_loss / (grad_accum_steps * args.mtp_n)
+                if scaler is not None:
+                    scaler.scale(scaled_head_loss).backward()
+                else:
+                    scaled_head_loss.backward()
+                del head_loss, scaled_head_loss
+            backward_mtp_trunk(trunk_state, head_state)
+            del trunk_state, head_state
+            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            if need_next_batch:
+                data_wait_start = time.time()
+                x, y, dataloader_state_dict = next(train_loader)
+                data_wait_time += time.time() - data_wait_start
+        train_loss = torch.stack(train_head_losses).mean()
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -718,7 +767,8 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_head_loss_fs = [head_loss.item() for head_loss in train_head_losses] # GPU sync point(s)
+    train_loss_f = sum(train_head_loss_fs) / len(train_head_loss_fs)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -748,7 +798,8 @@ while True:
         epoch = f"global sequence offset: {step * (total_batch_size // args.max_seq_len):,}"
     else:
         epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data wait: {data_wait_pct:.2f}% | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    mtp_loss_str = "" if args.mtp_n == 1 else " | mtp heads: " + ", ".join(f"t+{i}={loss:.4f}" for i, loss in enumerate(train_head_loss_fs, start=1))
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{mtp_loss_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data wait: {data_wait_pct:.2f}% | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -762,6 +813,10 @@ while True:
             "train/data_wait_pct": data_wait_pct,
             "train/epoch": epoch,
         }
+        if args.mtp_n > 1:
+            log_data["train/loss_sum"] = sum(train_head_loss_fs)
+            for head_idx, head_loss_f in enumerate(train_head_loss_fs, start=1):
+                log_data[f"train/loss_t+{head_idx}"] = head_loss_f
         wandb_run.log(log_data)
 
     # state update

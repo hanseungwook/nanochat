@@ -22,6 +22,10 @@ def log0(message):
 
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
+    # Old models use the ordinary next-token architecture.
+    if "mtp_n" not in model_config_kwargs:
+        model_config_kwargs["mtp_n"] = 1
+        log0("Patching missing mtp_n in model config to 1")
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
