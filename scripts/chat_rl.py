@@ -76,6 +76,9 @@ if model.config.mtp_n > 1:
     # RL uses only the ordinary next-token path, just like SFT and inference.
     model.freeze_mtp_aux_parameters()
     print0(f"Freezing MTP heads 2..{model.config.mtp_n} for next-token RL")
+if model.config.rsm:
+    model.freeze_rsm_parameters()
+    print0("Freezing the training-only RSM head for next-token RL")
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -313,7 +316,10 @@ for step in range(num_steps):
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
         depth = model.config.n_layer
-        default_model_tag = f"d{depth}" if model.config.mtp_n == 1 else f"d{depth}-mtp{model.config.mtp_n}"
+        if model.config.rsm:
+            default_model_tag = f"d{depth}-rsm"
+        else:
+            default_model_tag = f"d{depth}" if model.config.mtp_n == 1 else f"d{depth}-mtp{model.config.mtp_n}"
         output_dirname = args.model_tag if args.model_tag else default_model_tag
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
         model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
@@ -324,6 +330,7 @@ for step in range(num_steps):
             None, # note: we don't bother to save the optimizer state
             {
                 "model_config": model_config_kwargs,
+                "rsm_config": meta.get("rsm_config"),
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

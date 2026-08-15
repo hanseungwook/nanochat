@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Recurrent-state matching is a training-only auxiliary objective. Keeping
+    # it in model config allows strict reconstruction of RSM checkpoints.
+    rsm: bool = False
+    rsm_max_horizon: int = 128
+    rsm_seed: int = 42
 
 
 def norm(x):
@@ -52,6 +58,69 @@ class Linear(nn.Linear):
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
+
+
+class RSMFlowHead(nn.Module):
+    """Training-only conditional velocity model at the LM hidden width."""
+
+    feature_dim = 128
+
+    def __init__(self, width, max_horizon):
+        super().__init__()
+        if max_horizon < 1:
+            raise ValueError("RSM max horizon must be positive")
+        self.width = width
+        self.max_horizon = max_horizon
+        input_width = 2 * width + 2 * self.feature_dim
+        self.layers = nn.ModuleList([
+            Linear(input_width, width, bias=False),
+            Linear(width, width, bias=False),
+            Linear(width, width, bias=False),
+            Linear(width, width, bias=False),
+        ])
+        self.output = Linear(width, width, bias=False)
+        frequencies = self._make_frequencies(self.layers[0].weight.device)
+        self.register_buffer("frequencies", frequencies, persistent=False)
+
+    def _make_frequencies(self, device):
+        half_dim = self.feature_dim // 2
+        return 2 * math.pi * torch.exp(
+            torch.arange(half_dim, dtype=torch.float32, device=device)
+            * (math.log(10_000.0) / max(half_dim - 1, 1))
+        )
+
+    @torch.no_grad()
+    def init_weights(self, seed):
+        device = self.output.weight.device
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        for layer in self.layers:
+            bound = 3**0.5 * layer.in_features**-0.5
+            torch.nn.init.uniform_(layer.weight, -bound, bound, generator=generator)
+        torch.nn.init.zeros_(self.output.weight)
+        self.frequencies = self._make_frequencies(device)
+
+    def _features(self, values):
+        angles = values.float() * self.frequencies
+        return torch.cat((angles.sin(), angles.cos()), dim=-1)
+
+    def forward(self, z_tau, current_hidden, tau, horizons):
+        tau_features = self._features(tau)
+        horizon_scale = math.log(max(self.max_horizon, 2))
+        horizon_values = horizons.unsqueeze(-1).float().log() / horizon_scale
+        horizon_features = self._features(horizon_values)
+        x = torch.cat(
+            (
+                z_tau,
+                current_hidden,
+                tau_features.to(z_tau.dtype),
+                horizon_features.to(z_tau.dtype),
+            ),
+            dim=-1,
+        )
+        for layer in self.layers:
+            x = F.silu(layer(x))
+        return self.output(x)
 
 
 def has_ve(layer_idx, n_layer):
@@ -210,6 +279,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         assert 1 <= config.mtp_n <= config.n_layer, "mtp_n must be in [1, n_layer]"
+        assert not config.rsm or config.mtp_n == 1, "RSM requires mtp_n=1"
         if config.mtp_n > 1:
             assert config.mtp_n < config.n_layer, "MTP needs at least one shared trunk layer"
         self.mtp_n = config.mtp_n
@@ -253,6 +323,14 @@ class GPT(nn.Module):
         ])
         assert len(self.transformer.h) + len(self.mtp_heads) == config.n_layer
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        # nn.Linear performs a default initialization in ordinary (non-meta)
+        # construction. Isolate that incidental RNG consumption so later
+        # init_weights() starts from exactly the same state as the AR model.
+        if config.rsm:
+            with torch.random.fork_rng():
+                self.rsm_head = RSMFlowHead(config.n_embd, config.rsm_max_horizon)
+        else:
+            self.rsm_head = None
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -340,6 +418,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+
+        # RSM uses an isolated generator after the complete LM initialization,
+        # preserving the exact backbone initialization of the AR control arm.
+        if self.rsm_head is not None:
+            self.rsm_head.init_weights(self.config.rsm_seed)
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
@@ -449,8 +532,29 @@ class GPT(nn.Module):
         matmul in this model goes through the Linear class, while non-matmul params
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        # RSM is reported separately and never changes the LM scaling count.
+        active_roots = (self.transformer, self.mtp_heads, self.lm_head, self.smear_gate)
+        matmul_params = sum(
+            m.weight.numel()
+            for root in active_roots
+            for m in root.modules()
+            if isinstance(m, nn.Linear)
+        )
         return matmul_params
+
+    def num_rsm_params(self):
+        """Number of training-only RSM parameters, excluded from LM scaling."""
+        if self.rsm_head is None:
+            return 0
+        return sum(parameter.numel() for parameter in self.rsm_head.parameters())
+
+    def estimate_rsm_flops(self, pairs_per_sequence):
+        """RSM forward+backward matmul FLOPs, normalized per LM token."""
+        if self.rsm_head is None:
+            return 0.0
+        if pairs_per_sequence < 1:
+            raise ValueError("RSM pairs per sequence must be positive")
+        return 6 * self.num_rsm_params() * pairs_per_sequence / self.config.sequence_len
 
     def num_inference_matmul_params(self):
         """Matmul parameters used by the shared trunk and primary head only."""
@@ -459,7 +563,7 @@ class GPT(nn.Module):
             m.weight.numel()
             for root in active_roots
             for m in root.modules()
-            if isinstance(m, Linear)
+            if isinstance(m, nn.Linear)
         )
 
     def estimate_decode_flops(self, context_len):
@@ -520,7 +624,7 @@ class GPT(nn.Module):
         transformer_matrices = sum(p.numel() for block in self._all_blocks() for p in block.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        assert total + self.num_rsm_params() == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
@@ -543,6 +647,16 @@ class GPT(nn.Module):
         for param in self.mtp_aux_parameters():
             param.requires_grad_(False)
 
+    def rsm_parameters(self):
+        """Yield training-only flow parameters when the head is present."""
+        if self.rsm_head is not None:
+            yield from self.rsm_head.parameters()
+
+    def freeze_rsm_parameters(self):
+        """Freeze the RSM objective for SFT/RL while retaining strict state."""
+        for param in self.rsm_parameters():
+            param.requires_grad_(False)
+
     def setup_optimizer(
         self,
         unembedding_lr=0.004,
@@ -551,12 +665,17 @@ class GPT(nn.Module):
         weight_decay=0.0,
         scalar_lr=0.5,
         include_mtp_aux=True,
+        include_rsm=False,
     ):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
         active_blocks = self._all_blocks() if include_mtp_aux else tuple(self.transformer.h)
         matrix_params = [p for block in active_blocks for p in block.parameters()]
+        if include_rsm:
+            if self.rsm_head is None:
+                raise ValueError("Cannot include RSM optimizer parameters without an RSM head")
+            matrix_params.extend(self.rsm_parameters())
         if include_mtp_aux:
             value_embeds_params = list(self.value_embeds.parameters())
         else:
@@ -575,7 +694,13 @@ class GPT(nn.Module):
         optimizer_params = matrix_params + embedding_params + lm_head_params + value_embeds_params + resid_params + x0_params + smear_params
         assert len(optimizer_params) == len({id(param) for param in optimizer_params}), "Optimizer parameter appears in multiple groups"
         aux_param_ids = {id(param) for param in self.mtp_aux_parameters()}
-        expected_params = [param for param in self.parameters() if include_mtp_aux or id(param) not in aux_param_ids]
+        rsm_param_ids = {id(param) for param in self.rsm_parameters()}
+        expected_params = [
+            param
+            for param in self.parameters()
+            if (include_mtp_aux or id(param) not in aux_param_ids)
+            and (include_rsm or id(param) not in rsm_param_ids)
+        ]
         assert {id(param) for param in optimizer_params} == {id(param) for param in expected_params}, "Optimizer parameter coverage mismatch"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
@@ -662,7 +787,15 @@ class GPT(nn.Module):
         # A plain tuple keeps the boundary friendly to torch.compile.
         return x, x0, x_backout, cos_sin, idx
 
-    def forward_mtp_head(self, trunk_state, targets=None, head_idx=0, kv_cache=None, loss_reduction='mean'):
+    def forward_mtp_head(
+        self,
+        trunk_state,
+        targets=None,
+        head_idx=0,
+        kv_cache=None,
+        loss_reduction='mean',
+        return_hidden=False,
+    ):
         """Run one independent FAIR/Meta prediction head and the shared lm_head.
 
         `head_idx` is zero-based: 0 predicts t+1, 1 predicts t+2, etc.
@@ -695,6 +828,10 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
+        if return_hidden:
+            assert targets is None, "Hidden-state return does not consume LM targets"
+            return x
+
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
@@ -711,6 +848,64 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             return logits
+
+    def rsm_loss(self, hidden_states, current_positions, horizons, epsilon, tau):
+        """Compute dimension-normalized FP32 flow-matching velocity MSE."""
+        if self.rsm_head is None:
+            raise RuntimeError("RSM loss requested without an RSM flow head")
+        batch_size, _, width = hidden_states.shape
+        if current_positions.shape != horizons.shape:
+            raise ValueError("RSM current positions and horizons must have matching shapes")
+        expected_noise_shape = (*current_positions.shape, width)
+        if epsilon.shape != expected_noise_shape or tau.shape != (*current_positions.shape, 1):
+            raise ValueError("RSM noise/time tensors have incompatible shapes")
+        batch_indices = torch.arange(batch_size, device=hidden_states.device).unsqueeze(1)
+        current_hidden = hidden_states[batch_indices, current_positions]
+        # Stop gradients through the complete future target. Current states remain
+        # attached, allowing the auxiliary objective to train the causal LM.
+        future_hidden = hidden_states[batch_indices, current_positions + horizons].detach()
+        z_tau_fp32 = (1.0 - tau) * epsilon + tau * future_hidden.float()
+        velocity_target = future_hidden.float() - epsilon
+        velocity = self.rsm_head(
+            z_tau_fp32.to(hidden_states.dtype),
+            current_hidden,
+            tau,
+            horizons,
+        )
+        return (velocity.float() - velocity_target).square().mean(dim=-1).mean()
+
+    def forward_rsm(
+        self,
+        idx,
+        targets,
+        current_positions,
+        horizons,
+        epsilon,
+        tau,
+    ):
+        """One-backbone-pass training entry point returning NTP and RSM losses."""
+        if self.mtp_n != 1 or self.rsm_head is None:
+            raise RuntimeError("forward_rsm requires an RSM model with mtp_n=1")
+        trunk_state = self.forward_mtp_trunk(idx)
+        hidden_states = self.forward_mtp_head(
+            trunk_state,
+            head_idx=0,
+            return_hidden=True,
+        )
+        softcap = 15
+        logits = self.lm_head(hidden_states)[..., :self.config.vocab_size].float()
+        logits = softcap * torch.tanh(logits / softcap)
+        ntp_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+        )
+        rsm_loss = self.rsm_loss(
+            hidden_states,
+            current_positions,
+            horizons,
+            epsilon,
+            tau,
+        )
+        return ntp_loss, rsm_loss
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         """Backward-compatible ordinary next-token forward using MTP head 1."""
@@ -730,6 +925,10 @@ class GPT(nn.Module):
             slot = str(logical_slot)
             if slot in self.value_embeds:
                 del self.value_embeds[slot]
+
+    def drop_rsm_head(self):
+        """Release the training-only flow model without affecting AR logits."""
+        self.rsm_head = None
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

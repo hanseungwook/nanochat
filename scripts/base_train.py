@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear, detach_mtp_head_state, backward_mtp_trunk
+from nanochat.rsm import sample_rsm_batch, validate_rsm_resume_config
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.packed_data import (
     SAMPLER_VERSION,
@@ -69,6 +70,12 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--mtp-n", type=int, default=1, help="number of independent FAIR/Meta prediction heads (1 disables MTP; use 4 for the baseline)")
+parser.add_argument("--rsm", action="store_true", help="enable training-only recurrent-state matching")
+parser.add_argument("--rsm-loss-weight", type=float, default=0.1, help="weight of the RSM velocity loss")
+parser.add_argument("--rsm-max-horizon", type=int, default=128, help="maximum same-segment future-token horizon")
+parser.add_argument("--rsm-horizon-gamma", type=float, default=0.99, help="truncated-geometric horizon curriculum")
+parser.add_argument("--rsm-pairs-per-sequence", type=int, default=256, help="RSM pairs sampled with replacement per packed row")
+parser.add_argument("--rsm-seed", type=int, default=42, help="base seed for RSM initialization and sampling")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -104,6 +111,26 @@ except ValueError:
     parser.error("--save-at-steps must be a comma-separated list of integers")
 if any(step <= 0 for step in save_at_steps):
     parser.error("--save-at-steps values must be positive")
+if args.rsm and args.mtp_n != 1:
+    parser.error("--rsm requires --mtp-n=1; joint MTP+RSM is out of scope")
+if args.rsm_loss_weight < 0:
+    parser.error("--rsm-loss-weight must be non-negative")
+if args.rsm_max_horizon < 1:
+    parser.error("--rsm-max-horizon must be positive")
+if not 0 < args.rsm_horizon_gamma < 1:
+    parser.error("--rsm-horizon-gamma must be in (0, 1)")
+if args.rsm_pairs_per_sequence < 1:
+    parser.error("--rsm-pairs-per-sequence must be positive")
+if args.rsm_seed < 0:
+    parser.error("--rsm-seed must be non-negative")
+rsm_config = {
+    "enabled": args.rsm,
+    "loss_weight": args.rsm_loss_weight,
+    "max_horizon": args.rsm_max_horizon,
+    "horizon_gamma": args.rsm_horizon_gamma,
+    "pairs_per_sequence": args.rsm_pairs_per_sequence,
+    "seed": args.rsm_seed,
+}
 packed_manifest = None
 packed_target_tokens = None
 if args.dataset_manifest:
@@ -180,7 +207,10 @@ print0(f"Vocab size: {vocab_size:,}")
 # Resolve checkpoint metadata before model allocation so incompatible packed-data
 # resumes fail without spending GPU memory.
 base_dir = get_base_dir()
-default_model_tag = f"d{args.depth}" if args.mtp_n == 1 else f"d{args.depth}-mtp{args.mtp_n}"
+if args.rsm:
+    default_model_tag = f"d{args.depth}-rsm"
+else:
+    default_model_tag = f"d{args.depth}" if args.mtp_n == 1 else f"d{args.depth}-mtp{args.mtp_n}"
 output_dirname = args.model_tag if args.model_tag else default_model_tag
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
@@ -193,6 +223,7 @@ if resuming:
     checkpoint_mtp_n = checkpoint_config.get("mtp_n", 1)
     assert checkpoint_mtp_n == args.mtp_n, f"Checkpoint mtp_n={checkpoint_mtp_n} does not match --mtp-n={args.mtp_n}"
     assert checkpoint_config["n_layer"] == args.depth, f"Checkpoint depth={checkpoint_config['n_layer']} does not match --depth={args.depth}"
+    validate_rsm_resume_config(resume_meta, rsm_config)
     if packed_manifest is not None:
         expected_packed = {
             "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
@@ -229,6 +260,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         mtp_n=args.mtp_n,
+        rsm=args.rsm,
+        rsm_max_horizon=args.rsm_max_horizon,
+        rsm_seed=args.rsm_seed,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
@@ -345,7 +379,10 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 # becomes a dynamic graph input.
 mtp_trunk_forward = None
 mtp_head_forwards = []
-if args.mtp_n > 1:
+rsm_forward = None
+if args.rsm:
+    rsm_forward = torch.compile(orig_model.forward_rsm, dynamic=False)
+elif args.mtp_n > 1:
     mtp_trunk_forward = torch.compile(orig_model.forward_mtp_trunk, dynamic=False)
 
     def make_mtp_head_forward(head_idx):
@@ -364,8 +401,14 @@ print0("Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+lm_flops_per_token = model.estimate_flops()
+rsm_flops_per_token = model.estimate_rsm_flops(args.rsm_pairs_per_sequence) if args.rsm else 0.0
+num_flops_per_token = lm_flops_per_token + rsm_flops_per_token
+print0(f"LM parameters: {num_params:,}")
+print0(f"RSM parameters: {model.num_rsm_params():,}")
+print0(f"Estimated LM FLOPs per token: {lm_flops_per_token:e}")
+print0(f"Estimated RSM FLOPs per token: {rsm_flops_per_token:e}")
+print0(f"Estimated total FLOPs per token: {num_flops_per_token:e}")
 
 # 1) Use scaling laws to determine the optimal training horizon in tokens
 # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
@@ -424,6 +467,7 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    include_rsm=args.rsm,
 )
 
 if resuming:
@@ -671,6 +715,7 @@ while True:
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
+                "rsm_config": rsm_config,
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
@@ -705,7 +750,60 @@ while True:
     synchronize()
     t0 = time.time()
     data_wait_time = 0.0
-    if args.mtp_n == 1:
+    train_rsm_loss_f = None
+    rsm_horizon_mean_f = None
+    rsm_max_horizon_mean_f = None
+    rsm_horizon_max_f = None
+    if args.rsm:
+        train_ntp_loss = torch.zeros((), device=device)
+        train_rsm_loss = torch.zeros((), device=device)
+        rsm_horizon_mean = torch.zeros((), device=device)
+        rsm_max_horizon_mean = torch.zeros((), device=device)
+        rsm_horizon_max = torch.zeros((), device=device)
+        bos_token_id = tokenizer.get_bos_token_id()
+        for micro_step in range(grad_accum_steps):
+            samples = sample_rsm_batch(
+                x,
+                bos_token_id=bos_token_id,
+                pairs_per_sequence=args.rsm_pairs_per_sequence,
+                max_horizon=args.rsm_max_horizon,
+                gamma=args.rsm_horizon_gamma,
+                hidden_size=model_config.n_embd,
+                seed=args.rsm_seed,
+                optimizer_step=step,
+                micro_step=micro_step,
+                rank=ddp_rank,
+            )
+            ntp_loss, rsm_loss = rsm_forward(
+                x,
+                y,
+                samples.current_positions,
+                samples.horizons,
+                samples.epsilon,
+                samples.tau,
+            )
+            train_ntp_loss += ntp_loss.detach() / grad_accum_steps
+            train_rsm_loss += rsm_loss.detach() / grad_accum_steps
+            rsm_horizon_mean += samples.horizons.float().mean() / grad_accum_steps
+            rsm_max_horizon_mean += samples.max_horizons.float().mean() / grad_accum_steps
+            rsm_horizon_max = torch.maximum(rsm_horizon_max, samples.horizons.max().float())
+            total_loss = (ntp_loss + args.rsm_loss_weight * rsm_loss) / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
+            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            if need_next_batch:
+                data_wait_start = time.time()
+                x, y, dataloader_state_dict = next(train_loader)
+                data_wait_time += time.time() - data_wait_start
+        train_loss = train_ntp_loss
+        train_head_losses = [train_ntp_loss]
+        train_rsm_loss_f = train_rsm_loss.item()
+        rsm_horizon_mean_f = rsm_horizon_mean.item()
+        rsm_max_horizon_mean_f = rsm_max_horizon_mean.item()
+        rsm_horizon_max_f = rsm_horizon_max.item()
+    elif args.mtp_n == 1:
         for micro_step in range(grad_accum_steps):
             loss = model(x, y)
             train_loss = loss.detach() # for logging
@@ -799,7 +897,12 @@ while True:
     else:
         epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     mtp_loss_str = "" if args.mtp_n == 1 else " | mtp heads: " + ", ".join(f"t+{i}={loss:.4f}" for i, loss in enumerate(train_head_loss_fs, start=1))
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{mtp_loss_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data wait: {data_wait_pct:.2f}% | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    rsm_loss_str = "" if not args.rsm else (
+        f" | rsm: {train_rsm_loss_f:.6f}"
+        f" | horizon mean/max: {rsm_horizon_mean_f:.2f}/{rsm_horizon_max_f:.0f}"
+        f" | K mean: {rsm_max_horizon_mean_f:.2f}"
+    )
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{mtp_loss_str}{rsm_loss_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | data wait: {data_wait_pct:.2f}% | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -817,6 +920,12 @@ while True:
             log_data["train/loss_sum"] = sum(train_head_loss_fs)
             for head_idx, head_loss_f in enumerate(train_head_loss_fs, start=1):
                 log_data[f"train/loss_t+{head_idx}"] = head_loss_f
+        if args.rsm:
+            log_data["train/rsm_loss"] = train_rsm_loss_f
+            log_data["train/total_loss"] = train_loss_f + args.rsm_loss_weight * train_rsm_loss_f
+            log_data["train/rsm_horizon_mean"] = rsm_horizon_mean_f
+            log_data["train/rsm_horizon_max"] = rsm_horizon_max_f
+            log_data["train/rsm_dynamic_max_mean"] = rsm_max_horizon_mean_f
         wandb_run.log(log_data)
 
     # state update

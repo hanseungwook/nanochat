@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Matched Nanochat next-token and FAIR/Meta MTP-4 pretraining runs on the
+# Matched Nanochat next-token, FAIR/Meta MTP-4, and RSM pretraining runs on the
 # pinned Nemotron Specialized corpus. Run this inside an 8-GPU allocation.
 #
 # Usage:
 #   bash runs/nemotron_mtp_baselines.sh ar
 #   bash runs/nemotron_mtp_baselines.sh mtp
-#   bash runs/nemotron_mtp_baselines.sh both
-#   DRY_RUN=1 bash runs/nemotron_mtp_baselines.sh both
+#   bash runs/nemotron_mtp_baselines.sh rsm
+#   DATASET_SPLIT=train_50b  bash runs/nemotron_mtp_baselines.sh all
+#   DATASET_SPLIT=train_100b bash runs/nemotron_mtp_baselines.sh all
+#   DRY_RUN=1 bash runs/nemotron_mtp_baselines.sh all
 #
 # Additional arguments are forwarded to scripts.base_train before the fixed
 # dataset and variant arguments. Environment variables below override the
 # production defaults without editing this file.
 
-variant=${1:-both}
+variant=${1:-all}
 if (( $# > 0 )); then
     shift
 fi
 case "$variant" in
-    ar|mtp|both) ;;
+    ar|mtp|rsm|all) ;;
     *)
-        echo "usage: $0 {ar|mtp|both} [additional base_train arguments...]" >&2
+        echo "usage: $0 {ar|mtp|rsm|all} [additional base_train arguments...]" >&2
         exit 2
         ;;
 esac
@@ -62,7 +64,21 @@ device_batch_size=${DEVICE_BATCH_SIZE:-32}
 eval_device_batch_size=${EVAL_DEVICE_BATCH_SIZE:-$device_batch_size}
 total_batch_size=${TOTAL_BATCH_SIZE:-524288}
 dataset_split=${DATASET_SPLIT:-train_50b}
-save_at_steps=${SAVE_AT_STEPS:-1908,19073}
+case "$dataset_split" in
+    train_50b)
+        target_train_tokens=49673666560
+        default_save_at_steps=1908,19073
+        ;;
+    train_100b)
+        target_train_tokens=99347333120
+        default_save_at_steps=1908,19073,94745
+        ;;
+    *)
+        echo "DATASET_SPLIT must be train_50b or train_100b, got: $dataset_split" >&2
+        exit 2
+        ;;
+esac
+save_at_steps=${SAVE_AT_STEPS:-$default_save_at_steps}
 core_metric_every=${CORE_METRIC_EVERY:-999999}
 sample_every=${SAMPLE_EVERY:--1}
 run_prefix=${RUN_PREFIX:-nemotron-specialized-d${depth}}
@@ -82,10 +98,15 @@ if [[ -n "${DATA_CACHE_DIR:-}" ]]; then
 fi
 
 run_one() {
-    local mtp_n=$1
-    local suffix=$2
-    shift 2
-    local run_name="${run_prefix}-${suffix}"
+    local method=$1
+    local mtp_n=$2
+    local suffix=$3
+    shift 3
+    local run_name="${run_prefix}-${dataset_split}-${suffix}"
+    local method_args=()
+    if [[ "$method" == rsm ]]; then
+        method_args+=(--rsm)
+    fi
     local command=(
         torchrun --standalone --nproc_per_node="$nproc_per_node"
         -m scripts.base_train --
@@ -93,8 +114,10 @@ run_one() {
         "$@"
         --dataset-manifest="$manifest"
         --dataset-split="$dataset_split"
+        --target-train-tokens="$target_train_tokens"
         --tokenizer-dir="$tokenizer_dir"
         --mtp-n="$mtp_n"
+        "${method_args[@]}"
         --run="$run_name"
         --model-tag="$run_name"
     )
@@ -109,13 +132,17 @@ run_one() {
 
 case "$variant" in
     ar)
-        run_one 1 ar "$@"
+        run_one ar 1 ar "$@"
         ;;
     mtp)
-        run_one 4 mtp4 "$@"
+        run_one mtp 4 mtp4 "$@"
         ;;
-    both)
-        run_one 1 ar "$@"
-        run_one 4 mtp4 "$@"
+    rsm)
+        run_one rsm 1 rsm "$@"
+        ;;
+    all)
+        run_one ar 1 ar "$@"
+        run_one mtp 4 mtp4 "$@"
+        run_one rsm 1 rsm "$@"
         ;;
 esac
