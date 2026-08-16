@@ -337,7 +337,8 @@ def test_mixed_validation_metrics_preserve_exact_per_source_statistics():
 
         def __call__(self, x, _y, loss_reduction):
             assert loss_reduction == "none"
-            return x.float()
+            # GPT cross-entropy returns a flat vector for reduction="none".
+            return x.float().reshape(-1)
 
     x = torch.tensor([[1, 1], [1, 1], [3, 3], [3, 3]])
     y = torch.full_like(x, 2)

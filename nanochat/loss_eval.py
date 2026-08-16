@@ -87,6 +87,9 @@ def evaluate_loss_and_bpb_by_source(model, batches, steps, token_bytes, num_sour
     for _ in range(steps):
         x, y, source_ids = next(batch_iter)
         loss2d = model(x, y, loss_reduction="none")
+        if loss2d.numel() != y.numel():
+            raise RuntimeError("Per-token validation loss does not match the target layout")
+        loss2d = loss2d.reshape_as(y)
         valid = y >= 0
         y_safe = torch.where(valid, y, torch.zeros_like(y))
         num_bytes2d = torch.where(
