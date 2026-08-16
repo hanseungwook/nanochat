@@ -65,6 +65,7 @@ depth=${DEPTH:-10}
 device_batch_size=${DEVICE_BATCH_SIZE:-32}
 eval_device_batch_size=${EVAL_DEVICE_BATCH_SIZE:-$device_batch_size}
 total_batch_size=${TOTAL_BATCH_SIZE:-524288}
+eval_every=${EVAL_EVERY:-3000}
 dataset_split=${DATASET_SPLIT:-train_50b}
 case "$dataset_split" in
     train_50b)
@@ -91,6 +92,7 @@ common_args=(
     --device-batch-size="$device_batch_size"
     --eval-device-batch-size="$eval_device_batch_size"
     --total-batch-size="$total_batch_size"
+    --eval-every="$eval_every"
     --save-at-steps="$save_at_steps"
     --core-metric-every="$core_metric_every"
     --sample-every="$sample_every"

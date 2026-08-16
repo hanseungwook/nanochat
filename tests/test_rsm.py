@@ -348,6 +348,7 @@ def test_launcher_dry_runs_cover_six_independent_horizon_arms():
     combined = outputs["train_50b"] + outputs["train_100b"]
     names = [line.split(":", 1)[0] for line in combined]
     assert len(set(names)) == 6
+    assert all("--eval-every=3000" in line for line in combined)
     assert sum("--mtp-n=1" in line and "--rsm" not in line for line in combined) == 2
     assert sum("--mtp-n=4" in line for line in combined) == 2
     assert sum("--mtp-n=1" in line and "--rsm" in line for line in combined) == 2
