@@ -35,6 +35,7 @@ cd "$repo_root"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export NANOCHAT_DATA_ROOT=${NANOCHAT_DATA_ROOT:-/mnt/weka/shrd/k2m/seungwook.han/nanochat_data}
 export NANOCHAT_BASE_DIR=${NANOCHAT_BASE_DIR:-$NANOCHAT_DATA_ROOT/runtime}
+torchrun_bin=${TORCHRUN_BIN:-$repo_root/.venv/bin/torchrun}
 
 dataset_revision=9ed3718b5f2ae29074c5e34e64115432b7c4320f
 preprocessing_recipe=ratio-validation-v2
@@ -47,6 +48,10 @@ tokenizer_dir="$NANOCHAT_DATA_ROOT/tokenizers/nanochat-d32/$tokenizer_revision"
 
 dry_run=${DRY_RUN:-0}
 if [[ "$dry_run" != 1 ]]; then
+    if [[ ! -x "$torchrun_bin" ]]; then
+        echo "torchrun is missing or not executable: $torchrun_bin" >&2
+        exit 1
+    fi
     if [[ ! -f "$manifest" || ! -f "$verify_marker" ]]; then
         echo "Nemotron packed data is not ready or has not passed full verification." >&2
         echo "Expected manifest: $manifest" >&2
@@ -118,7 +123,7 @@ run_one() {
         method_args+=(--rsm)
     fi
     local command=(
-        torchrun --standalone --nproc_per_node="$nproc_per_node"
+        "$torchrun_bin" --standalone --nproc_per_node="$nproc_per_node"
         -m scripts.base_train --
         "${common_args[@]}"
         "$@"
