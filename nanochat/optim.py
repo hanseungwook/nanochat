@@ -20,7 +20,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=True, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -348,8 +348,11 @@ class MuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
+            # detach() preserves storage while preventing Parameter shapes from
+            # being guarded as static. The all-AdamW control intentionally runs
+            # this one fused kernel over many differently shaped tensors.
             adamw_step_fused(
-                p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
+                p_slice.detach(), grad_slice, state['exp_avg'], state['exp_avg_sq'],
                 self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                 self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
             )

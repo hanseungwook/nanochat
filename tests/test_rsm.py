@@ -264,6 +264,32 @@ def test_all_adamw_optimizer_covers_ar_and_rsm_with_matched_hyperparameters():
         make_model(rsm=False).setup_optimizer(optimizer_kind="sgd")
 
 
+def test_all_adamw_optimizer_steps_across_mixed_parameter_shapes(monkeypatch):
+    # CPU-only CI images do not carry the C++ toolchain used by Inductor. The
+    # production preflight separately exercises the dynamically compiled CUDA
+    # kernel; this unit test checks optimizer coverage and numerical updates.
+    import nanochat.optim as optim_module
+
+    monkeypatch.setattr(
+        optim_module,
+        "adamw_step_fused",
+        optim_module.adamw_step_fused.__wrapped__,
+    )
+    model = make_model(rsm=False)
+    optimizer = model.setup_optimizer(
+        optimizer_kind="adamw",
+        adamw_lr=6e-4,
+        adamw_weight_decay=0.1,
+    )
+    tokens = torch.randint(0, model.config.vocab_size, (2, model.config.sequence_len))
+    targets = torch.roll(tokens, shifts=-1, dims=1)
+    loss = model(tokens, targets)
+    loss.backward()
+    optimizer.step()
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+
+
 def test_old_checkpoint_config_defaults_to_rsm_disabled():
     config = {"n_layer": 4, "window_pattern": "L", "mtp_n": 1}
     _patch_missing_config_keys(config)
