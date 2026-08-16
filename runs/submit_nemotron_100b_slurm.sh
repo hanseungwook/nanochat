@@ -37,6 +37,9 @@ printf 'preflight=%s\n' "$preflight_job"
 for variant in ar mtp rsm; do
     job=$(sbatch "${resources[@]}" \
         --time=1-00:00:00 \
+        --requeue \
+        --signal=USR1@120 \
+        --open-mode=append \
         --dependency="afterok:$preflight_job" \
         --kill-on-invalid-dep=yes \
         --job-name="nemotron-100b-$variant" \

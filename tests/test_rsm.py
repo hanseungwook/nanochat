@@ -353,6 +353,7 @@ def test_launcher_dry_runs_cover_six_independent_horizon_arms():
     assert all("--total-batch-size=2097152" in line for line in combined)
     assert all("--save-every=3000" in line for line in combined)
     assert all("--keep-last-periodic-checkpoints=3" in line for line in combined)
+    assert all("--auto-resume" in line for line in combined)
     assert sum("--mtp-n=1" in line and "--rsm" not in line for line in combined) == 2
     assert sum("--mtp-n=4" in line for line in combined) == 2
     assert sum("--mtp-n=1" in line and "--rsm" in line for line in combined) == 2

@@ -35,6 +35,10 @@ cd "$repo_root"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export NANOCHAT_DATA_ROOT=${NANOCHAT_DATA_ROOT:-/mnt/weka/shrd/k2m/seungwook.han/nanochat_data}
 export NANOCHAT_BASE_DIR=${NANOCHAT_BASE_DIR:-$NANOCHAT_DATA_ROOT/runtime}
+# Slurm signals every process in the batch step. Keep the launcher and torchrun
+# supervisor alive; base_train workers replace this inherited disposition with
+# their checkpoint-request handler.
+trap '' USR1
 torchrun_bin=${TORCHRUN_BIN:-$repo_root/.venv/bin/torchrun}
 
 dataset_revision=9ed3718b5f2ae29074c5e34e64115432b7c4320f
@@ -73,6 +77,7 @@ total_batch_size=${TOTAL_BATCH_SIZE:-2097152}
 eval_every=${EVAL_EVERY:-3000}
 save_every=${SAVE_EVERY:-3000}
 keep_last_periodic_checkpoints=${KEEP_LAST_PERIODIC_CHECKPOINTS:-3}
+auto_resume=${AUTO_RESUME:-1}
 dataset_split=${DATASET_SPLIT:-train_50b}
 case "$dataset_split" in
     train_50b)
@@ -108,6 +113,14 @@ common_args=(
     --core-metric-every="$core_metric_every"
     --sample-every="$sample_every"
 )
+case "$auto_resume" in
+    1) common_args+=(--auto-resume) ;;
+    0) ;;
+    *)
+        echo "AUTO_RESUME must be 0 or 1, got: $auto_resume" >&2
+        exit 2
+        ;;
+esac
 if [[ -n "${DATA_CACHE_DIR:-}" ]]; then
     common_args+=(--data-cache-dir="$DATA_CACHE_DIR")
 fi
