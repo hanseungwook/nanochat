@@ -453,10 +453,16 @@ def packed_distributed_data_loader_with_state(
         )
         for _ in range(2)
     ]
-    device_rows = [
-        torch.empty(
-            (device_batch_size, context_length + 1), dtype=torch.long, device=device
-        )
+    # Keep x/y in separate persistent buffers. Slicing overlapping windows out
+    # of a (B, T + 1) device tensor would produce stride (T + 1, 1), while the
+    # compiled LM/MTP loss flattens targets. Materializing the two contiguous
+    # views here avoids graph failures and repeated copies in every MTP head.
+    device_inputs = [
+        torch.empty((device_batch_size, context_length), dtype=torch.long, device=device)
+        for _ in range(2)
+    ]
+    device_targets = [
+        torch.empty((device_batch_size, context_length), dtype=torch.long, device=device)
         for _ in range(2)
     ]
     optimizer_step = start_step
@@ -483,7 +489,8 @@ def packed_distributed_data_loader_with_state(
                 next_micro = 0
             _, next_future = request(next_step, next_micro)
             cpu_rows[slot].copy_(torch.from_numpy(rows.astype(np.int64)))
-            device_rows[slot].copy_(cpu_rows[slot], non_blocking=use_cuda)
+            device_inputs[slot].copy_(cpu_rows[slot][:, :-1], non_blocking=use_cuda)
+            device_targets[slot].copy_(cpu_rows[slot][:, 1:], non_blocking=use_cuda)
             state = {
                 "sampler_version": SAMPLER_VERSION,
                 "optimizer_step": optimizer_step,
@@ -491,7 +498,7 @@ def packed_distributed_data_loader_with_state(
                 "global_sequence_offset": optimizer_step * global_batch_sequences,
                 "global_batch_sequences": global_batch_sequences,
             }
-            yield device_rows[slot][:, :-1], device_rows[slot][:, 1:], state
+            yield device_inputs[slot], device_targets[slot], state
             slot = 1 - slot
             optimizer_step, micro_step = next_step, next_micro
             future = next_future

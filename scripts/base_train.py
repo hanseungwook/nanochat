@@ -102,6 +102,7 @@ parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="e
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--save-at-steps", type=str, default="", help="comma-separated additional optimizer steps to checkpoint")
+parser.add_argument("--no-save", action="store_true", help="disable all checkpoint writes (for short memory/throughput probes)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -702,7 +703,7 @@ while True:
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     periodic_save = step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0
     explicit_save = step > 0 and step != args.resume_from_step and step in save_at_steps
-    if last_step or periodic_save or explicit_save:
+    if not args.no_save and (last_step or periodic_save or explicit_save):
         save_checkpoint(
             checkpoint_dir,
             step,

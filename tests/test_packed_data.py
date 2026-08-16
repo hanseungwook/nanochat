@@ -282,6 +282,8 @@ def test_resume_and_shard_boundary_are_exact(tmp_path):
     )
     x, y, state = next(loader)
     assert state["global_sequence_offset"] == 4
+    assert x.is_contiguous()
+    assert y.is_contiguous()
     assert np.array_equal(x.numpy(), expected[4:8, :-1])
     assert np.array_equal(y.numpy(), expected[4:8, 1:])
     x, _, state = next(loader)
