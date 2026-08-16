@@ -32,14 +32,24 @@ resources=(
     --gres=gpu:8
     --cpus-per-task=64
     --mem=512G
-    --time=1-00:00:00
-    --requeue
-    --signal=USR1@120
-    --open-mode=append
 )
+
+preflight_job=$(sbatch "${resources[@]}" \
+    --time=02:00:00 \
+    --job-name=nemotron-100b-adamw-preflight \
+    --output="$log_dir/nemotron-100b-adamw-preflight-%j.out" \
+    --error="$log_dir/nemotron-100b-adamw-preflight-%j.err" \
+    --wrap="cd $repo_root && ADAMW_LR=$adamw_lr ADAMW_BETA1=$adamw_beta1 ADAMW_BETA2=$adamw_beta2 ADAMW_EPS=$adamw_eps ADAMW_WEIGHT_DECAY=$adamw_weight_decay bash runs/nemotron_adamw_100b_preflight.sh")
+printf 'preflight=%s\n' "$preflight_job"
 
 for variant in ar mtp rsm; do
     job=$(sbatch "${resources[@]}" \
+        --time=1-00:00:00 \
+        --requeue \
+        --signal=USR1@120 \
+        --open-mode=append \
+        --dependency="afterok:$preflight_job" \
+        --kill-on-invalid-dep=yes \
         --job-name="nemotron-100b-adamw-$variant" \
         --output="$log_dir/nemotron-100b-adamw-$variant-%j.out" \
         --error="$log_dir/nemotron-100b-adamw-$variant-%j.err" \

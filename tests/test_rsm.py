@@ -9,11 +9,15 @@ import torch
 
 from nanochat.checkpoint_manager import _patch_missing_config_keys
 from nanochat.gpt import GPT, GPTConfig, RSMFlowHead
+from nanochat.loss_eval import evaluate_rsm_loss_and_bpb_by_source
 from nanochat.rsm import (
     DEFAULT_RSM_CONFIG,
+    RSM_VALIDATION_HORIZONS,
+    RSM_VALIDATION_PAIRS_PER_HORIZON,
     remaining_segment_horizons,
     rsm_generator_seed,
     sample_rsm_batch,
+    sample_rsm_validation_batch,
     sample_truncated_geometric,
     validate_rsm_resume_config,
 )
@@ -109,6 +113,40 @@ def test_sampling_is_deterministic_and_every_pair_stays_in_one_segment():
         future_positions.flatten().tolist(),
     ):
         assert 1 not in tokens[row, current + 1 : future + 1].tolist()
+
+
+def test_validation_sampling_is_balanced_exact_k_1_through_16_only():
+    tokens = torch.tensor([
+        [1, *range(2, 21)],
+        [1, *range(21, 40)],
+        [1, 2, 3, 1, 4, 5, 1, 6, 7, 1, 8, 9, 1, 10, 11, 1, 12, 13, 14, 15],
+    ])
+    kwargs = dict(
+        bos_token_id=1,
+        hidden_size=8,
+        seed=42,
+        batch_index=3,
+        rank=0,
+    )
+    first = sample_rsm_validation_batch(tokens, **kwargs)
+    second = sample_rsm_validation_batch(tokens, **kwargs)
+    for left, right in zip(first.__dict__.values(), second.__dict__.values()):
+        assert torch.equal(left, right)
+
+    expected_horizons = torch.arange(1, 17).repeat_interleave(
+        RSM_VALIDATION_PAIRS_PER_HORIZON
+    )
+    assert RSM_VALIDATION_HORIZONS == tuple(range(1, 17))
+    assert torch.equal(first.horizons[0], expected_horizons)
+    assert first.current_positions.shape == (3, 256)
+    assert first.horizons.min().item() == 1
+    assert first.horizons.max().item() == 16
+
+    remaining = remaining_segment_horizons(tokens, bos_token_id=1)
+    available = remaining.gather(1, first.current_positions)
+    assert torch.all(available[first.valid_pairs] >= first.horizons[first.valid_pairs])
+    assert first.valid_pairs[:2].all()
+    assert not first.valid_pairs[2, -RSM_VALIDATION_PAIRS_PER_HORIZON:].any()
 
 
 def test_rsm_requires_the_ar_architecture():
@@ -268,6 +306,41 @@ def test_torch_compile_joint_training_smoke():
         samples.tau,
     )
     assert all(torch.isfinite(loss) for loss in losses)
+
+
+def test_joint_rsm_validation_matches_ntp_and_reports_exact_horizons():
+    model = make_model(rsm=True, sequence_len=20, rsm_max_horizon=16)
+    tokens = torch.stack((torch.arange(1, 21), torch.arange(21, 41))) % model.config.vocab_size
+    tokens[:, 0] = 1
+    targets = torch.roll(tokens, shifts=-1, dims=1)
+    targets[:, -1] = -1
+    source_ids = torch.tensor([0, 1])
+    token_bytes = torch.ones(model.config.vocab_size, dtype=torch.int64)
+
+    compiled_eval = torch.compile(model.forward_rsm_eval, dynamic=False, backend="eager")
+    metrics = evaluate_rsm_loss_and_bpb_by_source(
+        compiled_eval,
+        model.get_device(),
+        [(tokens, targets, source_ids)],
+        1,
+        token_bytes,
+        num_sources=2,
+        bos_token_id=1,
+        hidden_size=model.config.n_embd,
+        rsm_seed=42,
+    )
+    reference_loss = model(tokens, targets, loss_reduction="none").reshape_as(targets)
+    assert metrics["aggregate"]["loss"] == pytest.approx(
+        reference_loss[:, :-1].mean().item(), rel=1e-6
+    )
+    assert [item["horizon"] for item in metrics["rsm_by_horizon"]] == list(range(1, 17))
+    assert all(item["pair_count"] == 32 for item in metrics["rsm_by_horizon"])
+    assert metrics["aggregate"]["rsm_pair_count"] == 512
+    assert metrics["aggregate"]["rsm_prediction_rms"] == 0.0
+    assert metrics["aggregate"]["rsm_loss"] == pytest.approx(
+        metrics["aggregate"]["rsm_target_rms"] ** 2, rel=1e-6
+    )
+    assert all(source["rsm_pair_count"] == 256 for source in metrics["per_source"])
 
 
 @pytest.mark.slow

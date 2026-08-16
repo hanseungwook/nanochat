@@ -875,8 +875,8 @@ class GPT(nn.Module):
             # inference: just return the logits directly
             return logits
 
-    def rsm_loss(self, hidden_states, current_positions, horizons, epsilon, tau):
-        """Compute dimension-normalized FP32 flow-matching velocity MSE."""
+    def _rsm_pair_statistics(self, hidden_states, current_positions, horizons, epsilon, tau):
+        """Return per-pair flow MSE and velocity mean-square diagnostics."""
         if self.rsm_head is None:
             raise RuntimeError("RSM loss requested without an RSM flow head")
         batch_size, _, width = hidden_states.shape
@@ -898,7 +898,18 @@ class GPT(nn.Module):
             tau,
             horizons,
         )
-        return (velocity.float() - velocity_target).square().mean(dim=-1).mean()
+        velocity_fp32 = velocity.float()
+        pair_loss = (velocity_fp32 - velocity_target).square().mean(dim=-1)
+        prediction_mean_square = velocity_fp32.square().mean(dim=-1)
+        target_mean_square = velocity_target.square().mean(dim=-1)
+        return pair_loss, prediction_mean_square, target_mean_square
+
+    def rsm_loss(self, hidden_states, current_positions, horizons, epsilon, tau):
+        """Compute dimension-normalized FP32 flow-matching velocity MSE."""
+        pair_loss, _, _ = self._rsm_pair_statistics(
+            hidden_states, current_positions, horizons, epsilon, tau
+        )
+        return pair_loss.mean()
 
     def forward_rsm(
         self,
@@ -932,6 +943,42 @@ class GPT(nn.Module):
             tau,
         )
         return ntp_loss, rsm_loss
+
+    def forward_rsm_eval(
+        self,
+        idx,
+        targets,
+        current_positions,
+        horizons,
+        epsilon,
+        tau,
+    ):
+        """One-pass evaluation returning per-token and per-pair sufficient statistics."""
+        if self.mtp_n != 1 or self.rsm_head is None:
+            raise RuntimeError("forward_rsm_eval requires an RSM model with mtp_n=1")
+        trunk_state = self.forward_mtp_trunk(idx)
+        hidden_states = self.forward_mtp_head(
+            trunk_state,
+            head_idx=0,
+            return_hidden=True,
+        )
+        softcap = 15
+        logits = self.lm_head(hidden_states)[..., :self.config.vocab_size].float()
+        logits = softcap * torch.tanh(logits / softcap)
+        ntp_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=-1,
+            reduction="none",
+        ).reshape_as(targets)
+        pair_loss, prediction_mean_square, target_mean_square = self._rsm_pair_statistics(
+            hidden_states,
+            current_positions,
+            horizons,
+            epsilon,
+            tau,
+        )
+        return ntp_loss, pair_loss, prediction_mean_square, target_mean_square
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         """Backward-compatible ordinary next-token forward using MTP head 1."""

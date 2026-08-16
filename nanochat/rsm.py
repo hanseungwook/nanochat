@@ -14,6 +14,10 @@ DEFAULT_RSM_CONFIG = {
     "seed": 42,
 }
 
+RSM_VALIDATION_HORIZONS = tuple(range(1, 17))
+RSM_VALIDATION_PAIRS_PER_HORIZON = 16
+_RSM_VALIDATION_SEED_XOR = 0x5A17C9E3
+
 
 def validate_rsm_resume_config(metadata: dict, requested: dict) -> None:
     """Reject any objective/sampling change across a checkpoint resume."""
@@ -29,6 +33,17 @@ class RSMSamples:
     current_positions: torch.Tensor
     horizons: torch.Tensor
     max_horizons: torch.Tensor
+    epsilon: torch.Tensor
+    tau: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RSMValidationSamples:
+    """Fixed-shape exact-horizon samples for deterministic RSM validation."""
+
+    current_positions: torch.Tensor
+    horizons: torch.Tensor
+    valid_pairs: torch.Tensor
     epsilon: torch.Tensor
     tau: torch.Tensor
 
@@ -152,3 +167,78 @@ def sample_rsm_batch(
         generator=generator,
     )
     return RSMSamples(current_positions, horizons, dynamic_max, epsilon, tau)
+
+
+def sample_rsm_validation_batch(
+    tokens: torch.Tensor,
+    *,
+    bos_token_id: int,
+    hidden_size: int,
+    seed: int,
+    batch_index: int,
+    rank: int,
+    horizons: tuple[int, ...] = RSM_VALIDATION_HORIZONS,
+    pairs_per_horizon: int = RSM_VALIDATION_PAIRS_PER_HORIZON,
+) -> RSMValidationSamples:
+    """Sample equal numbers of valid positions for each exact validation horizon.
+
+    The default layout contains 16 positions for each k=1..16, preserving the
+    training-time total of 256 pairs per packed row while excluding every
+    horizon above 16. Rows without an eligible position for a particular k are
+    represented by masked fallback pairs so tensor shapes remain compile-safe.
+    """
+    if tokens.ndim != 2:
+        raise ValueError("RSM tokens must have shape (batch, sequence)")
+    if hidden_size < 1:
+        raise ValueError("RSM hidden size must be positive")
+    if pairs_per_horizon < 1:
+        raise ValueError("RSM validation pairs per horizon must be positive")
+    if not horizons or any(horizon < 1 for horizon in horizons):
+        raise ValueError("RSM validation horizons must be positive")
+    if tuple(sorted(set(horizons))) != horizons:
+        raise ValueError("RSM validation horizons must be sorted and unique")
+    if max(horizons) >= tokens.size(1):
+        raise ValueError("RSM validation horizon must be shorter than the sequence")
+    if min(seed, batch_index, rank) < 0:
+        raise ValueError("RSM validation seed coordinates must be non-negative")
+
+    remaining = remaining_segment_horizons(tokens, bos_token_id)
+    generator = torch.Generator(device=tokens.device)
+    validation_seed = seed ^ _RSM_VALIDATION_SEED_XOR
+    generator.manual_seed(rsm_generator_seed(validation_seed, 0, batch_index, rank))
+
+    sampled_positions = []
+    pair_validity = []
+    for horizon in horizons:
+        eligible = remaining.ge(horizon)
+        has_eligible = eligible.any(dim=1)
+        fallback = torch.zeros_like(eligible)
+        fallback[:, 0] = True
+        weights = torch.where(has_eligible.unsqueeze(1), eligible, fallback).to(torch.float32)
+        positions = torch.multinomial(
+            weights,
+            pairs_per_horizon,
+            replacement=True,
+            generator=generator,
+        )
+        sampled_positions.append(positions)
+        pair_validity.append(has_eligible.unsqueeze(1).expand(-1, pairs_per_horizon))
+
+    current_positions = torch.cat(sampled_positions, dim=1)
+    valid_pairs = torch.cat(pair_validity, dim=1)
+    horizon_values = torch.tensor(horizons, dtype=torch.long, device=tokens.device)
+    horizons_tensor = horizon_values.repeat_interleave(pairs_per_horizon)
+    horizons_tensor = horizons_tensor.unsqueeze(0).expand(tokens.size(0), -1)
+    epsilon = torch.randn(
+        (*current_positions.shape, hidden_size),
+        dtype=torch.float32,
+        device=tokens.device,
+        generator=generator,
+    )
+    tau = torch.rand(
+        (*current_positions.shape, 1),
+        dtype=torch.float32,
+        device=tokens.device,
+        generator=generator,
+    )
+    return RSMValidationSamples(current_positions, horizons_tensor, valid_pairs, epsilon, tau)

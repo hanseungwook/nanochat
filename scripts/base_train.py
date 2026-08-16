@@ -52,7 +52,11 @@ from nanochat.checkpoint_manager import (
     load_optimizer_state_resharded,
     save_checkpoint,
 )
-from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb_by_source
+from nanochat.loss_eval import (
+    evaluate_bpb,
+    evaluate_loss_and_bpb_by_source,
+    evaluate_rsm_loss_and_bpb_by_source,
+)
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -559,8 +563,10 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 mtp_trunk_forward = None
 mtp_head_forwards = []
 rsm_forward = None
+rsm_eval_forward = None
 if args.rsm:
     rsm_forward = torch.compile(orig_model.forward_rsm, dynamic=False)
+    rsm_eval_forward = torch.compile(orig_model.forward_rsm_eval, dynamic=False)
 elif args.mtp_n > 1:
     mtp_trunk_forward = torch.compile(orig_model.forward_mtp_trunk, dynamic=False)
 
@@ -827,6 +833,7 @@ while True:
     # once in a while: evaluate the val bpb (all ranks participate)
     if not preemption_save and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
+        rsm_metrics = None
         with disable_fp8(model):
             if packed_manifest is not None:
                 split = packed_manifest["splits"]["validation"]
@@ -836,13 +843,28 @@ while True:
                         "The full packed validation set must be divisible by the global eval batch"
                     )
                 eval_steps = split["token_count"] // eval_global_batch
-                metrics = evaluate_loss_and_bpb_by_source(
-                    model,
-                    build_val_loader(),
-                    eval_steps,
-                    token_bytes,
-                    num_sources=len(packed_manifest["sources"]),
-                )
+                if args.rsm:
+                    metrics = evaluate_rsm_loss_and_bpb_by_source(
+                        rsm_eval_forward,
+                        orig_model.get_device(),
+                        build_val_loader(),
+                        eval_steps,
+                        token_bytes,
+                        num_sources=len(packed_manifest["sources"]),
+                        bos_token_id=tokenizer.get_bos_token_id(),
+                        hidden_size=model_config.n_embd,
+                        rsm_seed=args.rsm_seed,
+                        rank=ddp_rank,
+                    )
+                    rsm_metrics = metrics
+                else:
+                    metrics = evaluate_loss_and_bpb_by_source(
+                        model,
+                        build_val_loader(),
+                        eval_steps,
+                        token_bytes,
+                        num_sources=len(packed_manifest["sources"]),
+                    )
                 val_bpb = metrics["aggregate"]["bpb"]
                 val_loss = metrics["aggregate"]["loss"]
                 source_metrics = {
@@ -852,12 +874,55 @@ while True:
             else:
                 val_loader = build_val_loader()
                 eval_steps = args.eval_tokens // (eval_device_batch_size * args.max_seq_len * ddp_world_size)
-                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-                val_loss = None
+                if args.rsm:
+                    validation_batches = (
+                        (
+                            x_val,
+                            y_val,
+                            torch.zeros(x_val.size(0), dtype=torch.long, device=x_val.device),
+                        )
+                        for x_val, y_val in val_loader
+                    )
+                    metrics = evaluate_rsm_loss_and_bpb_by_source(
+                        rsm_eval_forward,
+                        orig_model.get_device(),
+                        validation_batches,
+                        eval_steps,
+                        token_bytes,
+                        num_sources=1,
+                        bos_token_id=tokenizer.get_bos_token_id(),
+                        hidden_size=model_config.n_embd,
+                        rsm_seed=args.rsm_seed,
+                        rank=ddp_rank,
+                    )
+                    val_bpb = metrics["aggregate"]["bpb"]
+                    val_loss = metrics["aggregate"]["loss"]
+                    rsm_metrics = metrics
+                else:
+                    val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+                    val_loss = None
                 source_metrics = {}
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+        rsm_summary = "" if rsm_metrics is None else (
+            f" | RSM k1-16: {rsm_metrics['aggregate']['rsm_loss']:.6f}"
+            f" | pred/target RMS: {rsm_metrics['aggregate']['rsm_prediction_rms']:.4f}/"
+            f"{rsm_metrics['aggregate']['rsm_target_rms']:.4f}"
+            f" | max pair: {rsm_metrics['aggregate']['rsm_max_pair_loss']:.4f}"
+        )
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}{rsm_summary}")
+        if rsm_metrics is not None:
+            print0(
+                "  RSM exact horizons: "
+                + ", ".join(
+                    f"k={item['horizon']}:{item['loss']:.6f}"
+                    for item in rsm_metrics["rsm_by_horizon"]
+                )
+            )
         for source_name, metrics in source_metrics.items():
-            print0(f"  {source_name}: loss={metrics['loss']:.6f} bpb={metrics['bpb']:.6f}")
+            source_rsm = "" if rsm_metrics is None else f" rsm={metrics['rsm_loss']:.6f}"
+            print0(
+                f"  {source_name}: loss={metrics['loss']:.6f} "
+                f"bpb={metrics['bpb']:.6f}{source_rsm}"
+            )
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         val_log = {
@@ -868,10 +933,24 @@ while True:
         }
         if val_loss is not None:
             val_log["val/loss"] = val_loss
+        if rsm_metrics is not None:
+            aggregate_rsm = rsm_metrics["aggregate"]
+            val_log["val/rsm_loss"] = aggregate_rsm["rsm_loss"]
+            val_log["val/rsm_prediction_rms"] = aggregate_rsm["rsm_prediction_rms"]
+            val_log["val/rsm_target_rms"] = aggregate_rsm["rsm_target_rms"]
+            val_log["val/rsm_max_pair_loss"] = aggregate_rsm["rsm_max_pair_loss"]
+            val_log["val/rsm_pair_count"] = aggregate_rsm["rsm_pair_count"]
+            for item in rsm_metrics["rsm_by_horizon"]:
+                suffix = f"k{item['horizon']:02d}"
+                val_log[f"val/rsm_loss_{suffix}"] = item["loss"]
+                val_log[f"val/rsm_count_{suffix}"] = item["pair_count"]
         for source_name, metrics in source_metrics.items():
             metric_name = source_name.removeprefix("Nemotron-Pretraining-").lower().replace("-", "_")
             val_log[f"val/{metric_name}/loss"] = metrics["loss"]
             val_log[f"val/{metric_name}/bpb"] = metrics["bpb"]
+            if rsm_metrics is not None:
+                val_log[f"val/{metric_name}/rsm_loss"] = metrics["rsm_loss"]
+                val_log[f"val/{metric_name}/rsm_pair_count"] = metrics["rsm_pair_count"]
         wandb_run.log(val_log)
         model.train()
 
