@@ -892,7 +892,10 @@ while True:
             for head_idx, mtp_head_forward in enumerate(mtp_head_forwards):
                 head_loss = mtp_head_forward(head_state, y)
                 train_head_losses[head_idx] += head_loss.detach() / current_grad_accum_steps
-                scaled_head_loss = head_loss / (current_grad_accum_steps * args.mtp_n)
+                # Match Meta's MTP objective: every future-token head has unit
+                # weight. Each head loss is already a mean over its valid
+                # tokens, and only gradient accumulation is normalized here.
+                scaled_head_loss = head_loss / current_grad_accum_steps
                 if scaler is not None:
                     scaler.scale(scaled_head_loss).backward()
                 else:
@@ -905,7 +908,7 @@ while True:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
                 data_wait_time += time.time() - data_wait_start
-        train_loss = torch.stack(train_head_losses).mean()
+        train_loss = torch.stack(train_head_losses).sum()
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -929,7 +932,7 @@ while True:
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_head_loss_fs = [head_loss.item() for head_loss in train_head_losses] # GPU sync point(s)
-    train_loss_f = sum(train_head_loss_fs) / len(train_head_loss_fs)
+    train_loss_f = sum(train_head_loss_fs) if args.mtp_n > 1 else train_head_loss_fs[0]
     synchronize()
     t1 = time.time()
     dt = t1 - t0
