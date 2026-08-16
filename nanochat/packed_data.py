@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import shutil
 from bisect import bisect_right
@@ -286,12 +287,49 @@ def validate_training_compatibility(
         raise ManifestError(
             f"target_train_tokens must be in [1, {available_tokens}], got {target_tokens}"
         )
-    if target_tokens % global_token_batch:
+    if global_token_batch <= 0 or global_token_batch % context_length:
         raise ManifestError(
-            f"target_train_tokens ({target_tokens}) must be divisible by the global "
-            f"token batch ({global_token_batch})"
+            "Global token batch must be positive and divisible by context length"
         )
+    if target_tokens % context_length:
+        raise ManifestError("target_train_tokens must contain a whole number of packed rows")
     return target_tokens
+
+
+def build_packed_batch_schedule(
+    target_tokens: int,
+    global_token_batch: int,
+    context_length: int,
+    boundary_tokens: Sequence[int] = (),
+) -> tuple[list[int], list[int]]:
+    """Build exact optimizer batches, shortening only at requested boundaries.
+
+    Counts and offsets are in packed sequences. The returned offsets have one
+    more element than counts and therefore map optimizer steps to the exact
+    amount of data consumed at their start.
+    """
+    if context_length <= 0:
+        raise ManifestError("Context length must be positive")
+    if global_token_batch <= 0 or global_token_batch % context_length:
+        raise ManifestError("Global token batch must be divisible by context length")
+    if target_tokens <= 0 or target_tokens % context_length:
+        raise ManifestError("Target tokens must contain a whole number of packed rows")
+    boundaries = sorted(set(int(value) for value in boundary_tokens) | {target_tokens})
+    if any(value <= 0 or value > target_tokens for value in boundaries):
+        raise ManifestError("Batch boundaries must be in (0, target_train_tokens]")
+    if any(value % context_length for value in boundaries):
+        raise ManifestError("Batch boundaries must contain whole packed rows")
+
+    max_sequences = global_token_batch // context_length
+    counts: list[int] = []
+    offsets = [0]
+    for boundary_tokens_value in boundaries:
+        boundary = boundary_tokens_value // context_length
+        while offsets[-1] < boundary:
+            count = min(max_sequences, boundary - offsets[-1])
+            counts.append(count)
+            offsets.append(offsets[-1] + count)
+    return counts, offsets
 
 
 def sequence_ids_for_microbatch(
@@ -424,6 +462,7 @@ def packed_distributed_data_loader_with_state(
     rank: int = 0,
     world_size: int = 1,
     data_cache_dir: os.PathLike[str] | str | None = None,
+    batch_sequence_counts: Sequence[int] | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, dict]]:
     manifest = load_manifest(manifest_path)
     if manifest["packing"]["context_length"] != context_length:
@@ -431,10 +470,6 @@ def packed_distributed_data_loader_with_state(
     if global_token_batch % context_length:
         raise ManifestError("Global token batch must be divisible by context length")
     global_batch_sequences = global_token_batch // context_length
-    local_sequences = global_batch_sequences // world_size
-    if local_sequences % device_batch_size:
-        raise ManifestError("Global batch does not map evenly to rank-local device batches")
-    micro_steps = local_sequences // device_batch_size
     shards = resolve_split_shards(manifest, split_name)
     reader = PackedShardReader(
         manifest_path,
@@ -442,6 +477,24 @@ def packed_distributed_data_loader_with_state(
         context_length + 1,
         data_cache_dir=data_cache_dir,
     )
+    if batch_sequence_counts is None:
+        if reader.row_count % global_batch_sequences:
+            raise ManifestError("Packed split does not contain a whole number of global batches")
+        batch_counts = [global_batch_sequences] * (reader.row_count // global_batch_sequences)
+    else:
+        batch_counts = [int(value) for value in batch_sequence_counts]
+    if not batch_counts or any(value <= 0 or value > global_batch_sequences for value in batch_counts):
+        raise ManifestError("Scheduled batches must be in (0, configured global batch]")
+    batch_offsets = [0]
+    for value in batch_counts:
+        if value % world_size:
+            raise ManifestError("Every scheduled global batch must be divisible by world size")
+        local_sequences = value // world_size
+        if local_sequences > device_batch_size and local_sequences % device_batch_size:
+            raise ManifestError("Scheduled rank-local batches must use equal microbatches")
+        batch_offsets.append(batch_offsets[-1] + value)
+    if batch_offsets[-1] > reader.row_count:
+        raise ManifestError("Scheduled batches exceed the selected packed split")
 
     device = torch.device(device)
     use_cuda = device.type == "cuda"
@@ -470,38 +523,47 @@ def packed_distributed_data_loader_with_state(
     slot = 0
 
     def request(step: int, micro: int):
-        ids = sequence_ids_for_microbatch(
-            step, micro, device_batch_size, rank, world_size, global_batch_sequences
-        )
-        if ids.stop > reader.row_count:
-            return ids, None
-        return ids, executor.submit(reader.read_contiguous, ids.start, len(ids))
+        if step >= len(batch_counts):
+            return None, None, None
+        step_sequences = batch_counts[step]
+        local_sequences = step_sequences // world_size
+        step_micro_steps = max(1, math.ceil(local_sequences / device_batch_size))
+        if not 0 <= micro < step_micro_steps:
+            raise ManifestError(f"micro_step must be in [0, {step_micro_steps})")
+        local_start = micro * device_batch_size
+        count = min(device_batch_size, local_sequences - local_start)
+        start = batch_offsets[step] + rank * local_sequences + local_start
+        ids = range(start, start + count)
+        return ids, executor.submit(reader.read_contiguous, ids.start, len(ids)), step_micro_steps
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="packed-data-prefetch")
-    _, future = request(optimizer_step, micro_step)
+    ids, future, step_micro_steps = request(optimizer_step, micro_step)
     try:
         while future is not None:
             rows = future.result()
             next_step = optimizer_step
             next_micro = micro_step + 1
-            if next_micro == micro_steps:
+            if next_micro == step_micro_steps:
                 next_step += 1
                 next_micro = 0
-            _, next_future = request(next_step, next_micro)
-            cpu_rows[slot].copy_(torch.from_numpy(rows.astype(np.int64)))
-            device_inputs[slot].copy_(cpu_rows[slot][:, :-1], non_blocking=use_cuda)
-            device_targets[slot].copy_(cpu_rows[slot][:, 1:], non_blocking=use_cuda)
+            next_ids, next_future, next_micro_steps = request(next_step, next_micro)
+            count = len(ids)
+            cpu_rows[slot][:count].copy_(torch.from_numpy(rows.astype(np.int64)))
+            device_inputs[slot][:count].copy_(cpu_rows[slot][:count, :-1], non_blocking=use_cuda)
+            device_targets[slot][:count].copy_(cpu_rows[slot][:count, 1:], non_blocking=use_cuda)
             state = {
                 "sampler_version": SAMPLER_VERSION,
                 "optimizer_step": optimizer_step,
                 "micro_step": micro_step,
-                "global_sequence_offset": optimizer_step * global_batch_sequences,
-                "global_batch_sequences": global_batch_sequences,
+                "micro_steps": step_micro_steps,
+                "global_sequence_offset": batch_offsets[optimizer_step],
+                "global_batch_sequences": batch_counts[optimizer_step],
+                "configured_global_batch_sequences": global_batch_sequences,
             }
-            yield device_inputs[slot], device_targets[slot], state
+            yield device_inputs[slot][:count], device_targets[slot][:count], state
             slot = 1 - slot
             optimizer_step, micro_step = next_step, next_micro
-            future = next_future
+            ids, future, step_micro_steps = next_ids, next_future, next_micro_steps
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 

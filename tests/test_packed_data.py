@@ -24,6 +24,7 @@ from nanochat.nemotron_data import (
 from nanochat.packed_data import (
     MANIFEST_FORMAT,
     ManifestError,
+    build_packed_batch_schedule,
     compute_manifest_hash,
     load_manifest,
     packed_distributed_data_loader_with_state,
@@ -35,7 +36,7 @@ from nanochat.packed_data import (
     write_manifest,
 )
 from nanochat.loss_eval import evaluate_loss_and_bpb_by_source
-from nanochat.checkpoint_manager import load_optimizer_state_resharded
+from nanochat.checkpoint_manager import delete_checkpoint, load_optimizer_state_resharded
 from nanochat.gpt import GPT, GPTConfig
 
 
@@ -384,15 +385,14 @@ def test_tokenizer_and_target_mismatch_fail_before_training(tmp_path):
         target_tokens=-1,
         global_token_batch=16,
     ) == 128
-    with pytest.raises(ManifestError, match="divisible"):
-        validate_training_compatibility(
-            manifest,
-            "train_50b",
-            tokenizer_dir,
-            context_length=4,
-            target_tokens=124,
-            global_token_batch=16,
-        )
+    assert validate_training_compatibility(
+        manifest,
+        "train_50b",
+        tokenizer_dir,
+        context_length=4,
+        target_tokens=124,
+        global_token_batch=16,
+    ) == 124
     artifact["revision"] = "wrong"
     (tokenizer_dir / "artifact.json").write_text(json.dumps(artifact), encoding="utf-8")
     with pytest.raises(ManifestError, match="revision"):
@@ -404,6 +404,60 @@ def test_tokenizer_and_target_mismatch_fail_before_training(tmp_path):
             target_tokens=-1,
             global_token_batch=16,
         )
+
+
+def test_exact_batch_schedule_shortens_only_at_token_boundaries():
+    counts, offsets = build_packed_batch_schedule(
+        99_347_333_120,
+        1_024 * 2_048,
+        2_048,
+        (1_000_341_504, 9_999_745_024, 49_673_666_560),
+    )
+    assert len(counts) == 47_374
+    assert offsets[477] * 2_048 == 1_000_341_504
+    assert offsets[4_769] * 2_048 == 9_999_745_024
+    assert offsets[23_687] * 2_048 == 49_673_666_560
+    assert offsets[-1] * 2_048 == 99_347_333_120
+    assert counts.count(256) == 2
+    assert counts.count(1_024) == 47_372
+
+
+def test_scheduled_loader_emits_exact_partial_global_batches(tmp_path):
+    path, _, expected = _manifest_fixture(tmp_path)
+    counts = [4, 2, 4]
+    loaders = [
+        packed_distributed_data_loader_with_state(
+            path,
+            "train_50b",
+            2,
+            4,
+            "cpu",
+            16,
+            rank=rank,
+            world_size=2,
+            batch_sequence_counts=counts,
+        )
+        for rank in range(2)
+    ]
+    offset = 0
+    for step, count in enumerate(counts):
+        batches = [next(loader) for loader in loaders]
+        observed = np.concatenate([batch[0].numpy() for batch in batches], axis=0)
+        assert np.array_equal(observed, expected[offset : offset + count, :-1])
+        assert all(batch[2]["optimizer_step"] == step for batch in batches)
+        assert all(batch[2]["global_batch_sequences"] == count for batch in batches)
+        offset += count
+
+
+def test_checkpoint_deletion_is_rank_local_and_idempotent(tmp_path):
+    for name in ("model_003000.pt", "meta_003000.json", "optim_003000_rank0.pt", "optim_003000_rank1.pt"):
+        (tmp_path / name).write_bytes(b"checkpoint")
+    delete_checkpoint(tmp_path, 3_000, rank=1)
+    assert not (tmp_path / "optim_003000_rank1.pt").exists()
+    assert (tmp_path / "model_003000.pt").exists()
+    delete_checkpoint(tmp_path, 3_000, rank=0)
+    delete_checkpoint(tmp_path, 3_000, rank=0)
+    assert not list(tmp_path.iterdir())
 
 
 def test_lossless_packer_preserves_oversized_document_tokens():

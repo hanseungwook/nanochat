@@ -69,6 +69,24 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
+
+def delete_checkpoint(checkpoint_dir, step, rank=0):
+    """Delete one rank's files for an explicitly resolved checkpoint step."""
+    paths = [os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")]
+    if rank == 0:
+        paths.extend(
+            [
+                os.path.join(checkpoint_dir, f"model_{step:06d}.pt"),
+                os.path.join(checkpoint_dir, f"meta_{step:06d}.json"),
+            ]
+        )
+    for path in paths:
+        try:
+            os.remove(path)
+            logger.info(f"Removed expired checkpoint file: {path}")
+        except FileNotFoundError:
+            pass
+
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")

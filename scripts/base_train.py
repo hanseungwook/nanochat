@@ -31,6 +31,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.packed_data import (
     SAMPLER_VERSION,
     PackedShardReader,
+    build_packed_batch_schedule,
     load_manifest,
     packed_distributed_data_loader_with_state,
     packed_distributed_validation_loader,
@@ -39,7 +40,7 @@ from nanochat.packed_data import (
 )
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, load_optimizer_state_resharded
+from nanochat.checkpoint_manager import delete_checkpoint, save_checkpoint, load_checkpoint, load_optimizer_state_resharded
 from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb_by_source
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -93,6 +94,7 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--stop-after-step", type=int, default=-1, help="save and exit at this optimizer step (-1 = run to horizon)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -101,7 +103,9 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--keep-last-periodic-checkpoints", type=int, default=-1, help="retain only the latest N non-milestone periodic checkpoints (-1 = retain all)")
 parser.add_argument("--save-at-steps", type=str, default="", help="comma-separated additional optimizer steps to checkpoint")
+parser.add_argument("--save-at-tokens", type=str, default="", help="comma-separated exact packed-token boundaries to checkpoint")
 parser.add_argument("--no-save", action="store_true", help="disable all checkpoint writes (for short memory/throughput probes)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -112,6 +116,14 @@ except ValueError:
     parser.error("--save-at-steps must be a comma-separated list of integers")
 if any(step <= 0 for step in save_at_steps):
     parser.error("--save-at-steps values must be positive")
+if args.keep_last_periodic_checkpoints < -1:
+    parser.error("--keep-last-periodic-checkpoints must be -1 or non-negative")
+try:
+    save_at_tokens = {int(value) for value in args.save_at_tokens.split(",") if value.strip()}
+except ValueError:
+    parser.error("--save-at-tokens must be a comma-separated list of integers")
+if any(tokens <= 0 for tokens in save_at_tokens):
+    parser.error("--save-at-tokens values must be positive")
 if args.rsm and args.mtp_n != 1:
     parser.error("--rsm requires --mtp-n=1; joint MTP+RSM is out of scope")
 if args.rsm_loss_weight < 0:
@@ -124,6 +136,8 @@ if args.rsm_pairs_per_sequence < 1:
     parser.error("--rsm-pairs-per-sequence must be positive")
 if args.rsm_seed < 0:
     parser.error("--rsm-seed must be non-negative")
+if args.stop_after_step < -1:
+    parser.error("--stop-after-step must be -1 or non-negative")
 rsm_config = {
     "enabled": args.rsm,
     "loss_weight": args.rsm_loss_weight,
@@ -134,6 +148,8 @@ rsm_config = {
 }
 packed_manifest = None
 packed_target_tokens = None
+packed_batch_sequence_counts = None
+packed_batch_offsets = None
 if args.dataset_manifest:
     if args.tokenizer_dir is None:
         parser.error("--tokenizer-dir is required with --dataset-manifest")
@@ -148,6 +164,20 @@ if args.dataset_manifest:
         target_tokens=args.target_train_tokens,
         global_token_batch=args.total_batch_size,
     )
+    try:
+        packed_batch_sequence_counts, packed_batch_offsets = build_packed_batch_schedule(
+            packed_target_tokens,
+            args.total_batch_size,
+            args.max_seq_len,
+            save_at_tokens,
+        )
+    except Exception as exc:
+        parser.error(str(exc))
+    offset_to_step = {offset: step for step, offset in enumerate(packed_batch_offsets)}
+    save_at_steps.update(
+        offset_to_step[tokens // args.max_seq_len]
+        for tokens in save_at_tokens
+    )
     # Stat every selected shard and validate its declared row/byte length before
     # model allocation. Full content checksums belong to prepare_nemotron verify.
     PackedShardReader(
@@ -155,8 +185,12 @@ if args.dataset_manifest:
         resolve_split_shards(packed_manifest, args.dataset_split),
         args.max_seq_len + 1,
     )
-    if args.num_iterations > 0 and args.num_iterations * args.total_batch_size != packed_target_tokens:
+    if args.num_iterations > 0 and args.num_iterations != len(packed_batch_sequence_counts):
         parser.error("--num-iterations conflicts with --target-train-tokens for packed data")
+    if args.stop_after_step > len(packed_batch_sequence_counts):
+        parser.error("--stop-after-step exceeds the packed training horizon")
+elif save_at_tokens:
+    parser.error("--save-at-tokens requires packed data")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -226,13 +260,16 @@ if resuming:
     assert checkpoint_config["n_layer"] == args.depth, f"Checkpoint depth={checkpoint_config['n_layer']} does not match --depth={args.depth}"
     validate_rsm_resume_config(resume_meta, rsm_config)
     if packed_manifest is not None:
+        if not 0 <= args.resume_from_step < len(packed_batch_offsets):
+            raise RuntimeError("Packed-data resume step is outside the batch schedule")
         expected_packed = {
             "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
             "split": args.dataset_split,
             "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
             "optimizer_step": args.resume_from_step,
-            "global_sequence_offset": args.resume_from_step * (args.total_batch_size // args.max_seq_len),
+            "global_sequence_offset": packed_batch_offsets[args.resume_from_step],
             "global_batch_sequences": args.total_batch_size // args.max_seq_len,
+            "batch_boundary_tokens": sorted(save_at_tokens),
             "context_length": args.max_seq_len,
             "sampler_version": SAMPLER_VERSION,
         }
@@ -505,6 +542,7 @@ if packed_manifest is not None:
         rank=ddp_rank,
         world_size=ddp_world_size,
         data_cache_dir=args.data_cache_dir,
+        batch_sequence_counts=packed_batch_sequence_counts,
     )
     build_val_loader = lambda: packed_distributed_validation_loader(
         args.dataset_manifest,
@@ -529,8 +567,8 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert packed_manifest is not None or args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if packed_manifest is not None:
-    num_iterations = packed_target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from packed token horizon: {num_iterations:,}")
+    num_iterations = len(packed_batch_sequence_counts)
+    print0(f"Calculated number of iterations from exact packed batch schedule: {num_iterations:,}")
 elif args.num_iterations > 0:
     # Override num_iterations to a specific value if given
     num_iterations = args.num_iterations
@@ -545,9 +583,9 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
+total_tokens = packed_target_tokens if packed_manifest is not None else total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+print0(f"Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -609,7 +647,12 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    trained_tokens = (
+        packed_batch_offsets[step] * args.max_seq_len
+        if packed_manifest is not None
+        else total_batch_size * step
+    )
+    flops_so_far = num_flops_per_token * trained_tokens
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -703,7 +746,8 @@ while True:
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     periodic_save = step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0
     explicit_save = step > 0 and step != args.resume_from_step and step in save_at_steps
-    if not args.no_save and (last_step or periodic_save or explicit_save):
+    requested_stop = args.stop_after_step == step
+    if not args.no_save and (last_step or requested_stop or periodic_save or explicit_save):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -723,9 +767,10 @@ while True:
                     "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
                     "split": args.dataset_split,
                     "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
-                    "global_sequence_offset": step * (total_batch_size // args.max_seq_len),
+                    "global_sequence_offset": packed_batch_offsets[step],
                     "optimizer_step": step,
                     "global_batch_sequences": total_batch_size // args.max_seq_len,
+                    "batch_boundary_tokens": sorted(save_at_tokens),
                     "context_length": args.max_seq_len,
                     "sampler_version": SAMPLER_VERSION,
                     "optimizer_world_size": ddp_world_size,
@@ -738,9 +783,20 @@ while True:
             },
             rank=ddp_rank,
         )
+        if args.save_every > 0 and args.keep_last_periodic_checkpoints >= 0:
+            protected_steps = save_at_steps | {num_iterations}
+            periodic_steps = [
+                saved_step
+                for saved_step in range(args.save_every, step + 1, args.save_every)
+                if saved_step not in protected_steps
+            ]
+            keep = args.keep_last_periodic_checkpoints
+            expired_steps = periodic_steps if keep == 0 else periodic_steps[:-keep]
+            for expired_step in expired_steps:
+                delete_checkpoint(checkpoint_dir, expired_step, rank=ddp_rank)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
-    if last_step:
+    if last_step or requested_stop:
         break
 
     # -------------------------------------------------------------------------
@@ -753,6 +809,14 @@ while True:
     rsm_horizon_mean_f = None
     rsm_max_horizon_mean_f = None
     rsm_horizon_max_f = None
+    current_grad_accum_steps = dataloader_state_dict.get("micro_steps", grad_accum_steps)
+    step_batch_sequences = dataloader_state_dict.get(
+        "global_batch_sequences", total_batch_size // args.max_seq_len
+    )
+    step_batch_tokens = step_batch_sequences * args.max_seq_len
+    step_sequence_offset = dataloader_state_dict.get(
+        "global_sequence_offset", step * (total_batch_size // args.max_seq_len)
+    )
     if args.rsm:
         train_ntp_loss = torch.zeros((), device=device)
         train_rsm_loss = torch.zeros((), device=device)
@@ -760,7 +824,7 @@ while True:
         rsm_max_horizon_mean = torch.zeros((), device=device)
         rsm_horizon_max = torch.zeros((), device=device)
         bos_token_id = tokenizer.get_bos_token_id()
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(current_grad_accum_steps):
             samples = sample_rsm_batch(
                 x,
                 bos_token_id=bos_token_id,
@@ -781,17 +845,17 @@ while True:
                 samples.epsilon,
                 samples.tau,
             )
-            train_ntp_loss += ntp_loss.detach() / grad_accum_steps
-            train_rsm_loss += rsm_loss.detach() / grad_accum_steps
-            rsm_horizon_mean += samples.horizons.float().mean() / grad_accum_steps
-            rsm_max_horizon_mean += samples.max_horizons.float().mean() / grad_accum_steps
+            train_ntp_loss += ntp_loss.detach() / current_grad_accum_steps
+            train_rsm_loss += rsm_loss.detach() / current_grad_accum_steps
+            rsm_horizon_mean += samples.horizons.float().mean() / current_grad_accum_steps
+            rsm_max_horizon_mean += samples.max_horizons.float().mean() / current_grad_accum_steps
             rsm_horizon_max = torch.maximum(rsm_horizon_max, samples.horizons.max().float())
-            total_loss = (ntp_loss + args.rsm_loss_weight * rsm_loss) / grad_accum_steps
+            total_loss = (ntp_loss + args.rsm_loss_weight * rsm_loss) / current_grad_accum_steps
             if scaler is not None:
                 scaler.scale(total_loss).backward()
             else:
                 total_loss.backward()
-            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            need_next_batch = not (step == num_iterations - 1 and micro_step == current_grad_accum_steps - 1)
             if need_next_batch:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
@@ -803,15 +867,15 @@ while True:
         rsm_max_horizon_mean_f = rsm_max_horizon_mean.item()
         rsm_horizon_max_f = rsm_horizon_max.item()
     elif args.mtp_n == 1:
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(current_grad_accum_steps):
             loss = model(x, y)
             train_loss = loss.detach() # for logging
-            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss = loss / current_grad_accum_steps # each .backward() is a grad sum => normalize loss here
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            need_next_batch = not (step == num_iterations - 1 and micro_step == current_grad_accum_steps - 1)
             if need_next_batch:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
@@ -822,13 +886,13 @@ while True:
         # time. Each head accumulates gradients on detached trunk-boundary
         # tensors; after all heads finish, traverse the shared trunk once.
         train_head_losses = [torch.zeros((), device=device) for _ in range(args.mtp_n)]
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(current_grad_accum_steps):
             trunk_state = mtp_trunk_forward(x)
             head_state = detach_mtp_head_state(trunk_state)
             for head_idx, mtp_head_forward in enumerate(mtp_head_forwards):
                 head_loss = mtp_head_forward(head_state, y)
-                train_head_losses[head_idx] += head_loss.detach() / grad_accum_steps
-                scaled_head_loss = head_loss / (grad_accum_steps * args.mtp_n)
+                train_head_losses[head_idx] += head_loss.detach() / current_grad_accum_steps
+                scaled_head_loss = head_loss / (current_grad_accum_steps * args.mtp_n)
                 if scaler is not None:
                     scaler.scale(scaled_head_loss).backward()
                 else:
@@ -836,7 +900,7 @@ while True:
                 del head_loss, scaled_head_loss
             backward_mtp_trunk(trunk_state, head_state)
             del trunk_state, head_state
-            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            need_next_batch = not (step == num_iterations - 1 and micro_step == current_grad_accum_steps - 1)
             if need_next_batch:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
@@ -876,8 +940,8 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    tok_per_sec = int(step_batch_tokens / dt)
+    flops_per_sec = num_flops_per_token * step_batch_tokens / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     data_wait_pct = 100 * data_wait_time / dt
     if step > 10:
@@ -892,7 +956,7 @@ while True:
     else:
         eta_str = ""
     if packed_manifest is not None:
-        epoch = f"global sequence offset: {step * (total_batch_size // args.max_seq_len):,}"
+        epoch = f"global sequence offset: {step_sequence_offset:,}"
     else:
         epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     mtp_loss_str = "" if args.mtp_n == 1 else " | mtp heads: " + ", ".join(f"t+{i}={loss:.4f}" for i, loss in enumerate(train_head_loss_fs, start=1))

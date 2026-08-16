@@ -349,10 +349,17 @@ def test_launcher_dry_runs_cover_six_independent_horizon_arms():
     names = [line.split(":", 1)[0] for line in combined]
     assert len(set(names)) == 6
     assert all("--eval-every=3000" in line for line in combined)
+    assert all("--device-batch-size=128" in line for line in combined)
+    assert all("--total-batch-size=2097152" in line for line in combined)
+    assert all("--save-every=3000" in line for line in combined)
+    assert all("--keep-last-periodic-checkpoints=3" in line for line in combined)
     assert sum("--mtp-n=1" in line and "--rsm" not in line for line in combined) == 2
     assert sum("--mtp-n=4" in line for line in combined) == 2
     assert sum("--mtp-n=1" in line and "--rsm" in line for line in combined) == 2
     assert all("--target-train-tokens=49673666560" in line for line in outputs["train_50b"])
-    assert all("--save-at-steps=1908\\,19073" in line for line in outputs["train_50b"])
+    assert all("--save-at-tokens=1000341504\\,9999745024" in line for line in outputs["train_50b"])
     assert all("--target-train-tokens=99347333120" in line for line in outputs["train_100b"])
-    assert all("--save-at-steps=1908\\,19073\\,94745" in line for line in outputs["train_100b"])
+    assert all(
+        "--save-at-tokens=1000341504\\,9999745024\\,49673666560" in line
+        for line in outputs["train_100b"]
+    )
