@@ -45,11 +45,14 @@ DATASET_REPOSITORY = "nvidia/Nemotron-Pretraining-Specialized-v1"
 DATASET_REVISION = "9ed3718b5f2ae29074c5e34e64115432b7c4320f"
 TOKENIZER_REPOSITORY = "karpathy/nanochat-d32"
 TOKENIZER_REVISION = "016dba034c9c0ca9033ad1bc721bceff54680600"
+PREPROCESSING_RECIPE = "ratio-validation-v2"
 MASTER_SEED = 20260814
 CONTEXT_LENGTH = 2048
 ROW_WIDTH = CONTEXT_LENGTH + 1
 PACKER_VERSION = "bos-bestfit-lossless-v1"
-VALIDATION_SEQUENCES = 2048
+VALIDATION_SEQUENCE_COUNT = 12_288
+VALIDATION_CANDIDATE_FRACTION = 0.01
+VALIDATION_CAPACITY_OVERSAMPLE = 1.05
 DEFAULT_MIN_FREE_GB = 800
 DEFAULT_SHARD_GB = 2.0
 
@@ -86,6 +89,60 @@ SEGMENT_SEQUENCE_COUNT = sum(source.sequences_per_segment for source in SOURCES)
 SEGMENT_TOKEN_COUNT = SEGMENT_SEQUENCE_COUNT * CONTEXT_LENGTH
 
 
+def ratio_matched_sequence_counts(total: int = VALIDATION_SEQUENCE_COUNT) -> dict[str, int]:
+    """Allocate an exact number of rows with deterministic largest remainders."""
+    if total <= 0:
+        raise ValueError("Validation sequence count must be positive")
+    weight_sum = sum(source.ratio_units for source in SOURCES)
+    counts = {
+        source.name: total * source.ratio_units // weight_sum
+        for source in SOURCES
+    }
+    remaining = total - sum(counts.values())
+    order = sorted(
+        SOURCES,
+        key=lambda source: (
+            -(total * source.ratio_units % weight_sum),
+            source.source_id,
+        ),
+    )
+    for source in order[:remaining]:
+        counts[source.name] += 1
+    return counts
+
+
+VALIDATION_SEQUENCES_BY_SOURCE = ratio_matched_sequence_counts()
+
+
+def preprocessing_recipe_sha256() -> str:
+    payload = {
+        "recipe": PREPROCESSING_RECIPE,
+        "dataset_revision": DATASET_REVISION,
+        "tokenizer_revision": TOKENIZER_REVISION,
+        "master_seed": MASTER_SEED,
+        "context_length": CONTEXT_LENGTH,
+        "packer_version": PACKER_VERSION,
+        "validation_sequence_count": VALIDATION_SEQUENCE_COUNT,
+        "validation_sequences_by_source": VALIDATION_SEQUENCES_BY_SOURCE,
+        "validation_candidate_fraction": VALIDATION_CANDIDATE_FRACTION,
+        "validation_capacity_oversample": VALIDATION_CAPACITY_OVERSAMPLE,
+        "sources": [
+            {
+                "source_id": source.source_id,
+                "name": source.name,
+                "ratio_units": source.ratio_units,
+                "sequences_per_segment": source.sequences_per_segment,
+            }
+            for source in SOURCES
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+PREPROCESSING_RECIPE_SHA256 = preprocessing_recipe_sha256()
+
+
 def derive_seed(label: str) -> int:
     payload = f"{MASTER_SEED}:{label}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
@@ -114,6 +171,7 @@ def source_name_from_path(relative_path: str) -> str:
 class DataLayout:
     root: Path
     dataset_root: Path
+    recipe_root: Path
     raw: Path
     staging: Path
     packed: Path
@@ -124,12 +182,14 @@ class DataLayout:
 def data_layout(data_root: os.PathLike[str] | str) -> DataLayout:
     root = Path(data_root).expanduser().resolve()
     dataset_root = root / "datasets" / "nemotron-specialized-v1" / DATASET_REVISION
+    recipe_root = dataset_root / "recipes" / PREPROCESSING_RECIPE
     return DataLayout(
         root=root,
         dataset_root=dataset_root,
+        recipe_root=recipe_root,
         raw=dataset_root / "raw",
-        staging=dataset_root / "staging",
-        packed=dataset_root / "packed" / "v1",
+        staging=recipe_root / "staging",
+        packed=recipe_root / "packed" / "v1",
         tokenizer=root / "tokenizers" / "nanochat-d32" / TOKENIZER_REVISION,
         runtime=root / "runtime",
     )
@@ -176,6 +236,7 @@ def _mkdir_group(path: Path) -> None:
 def initialize_layout(layout: DataLayout) -> None:
     for path in (
         layout.root,
+        layout.recipe_root,
         layout.raw,
         layout.staging,
         layout.packed / "train_segment_000",
@@ -394,10 +455,8 @@ def _scan_audit_files(
         for source in SOURCES
     }
     sample_heaps = {source.name: [] for source in SOURCES}
-    validation_heaps = {source.name: [] for source in SOURCES}
     seen_uuids: set[str] = set()
     uuid_entries: list[tuple[str, str]] = []
-    validation_limit = VALIDATION_SEQUENCES * 4
 
     for entry in assigned_files:
         source_name = source_name_from_path(entry["path"])
@@ -442,13 +501,6 @@ def _scan_audit_files(
                     (audit_key.hex(), uuid, len(text), byte_count, text),
                     sample_per_source,
                 )
-                validation_key = document_key(uuid, "validation")
-                _bounded_smallest(
-                    validation_heaps[source_name],
-                    int.from_bytes(validation_key, "big"),
-                    (validation_key.hex(), uuid, entry["path"], row_group, row_index),
-                    validation_limit,
-                )
 
     uuid_entries.sort()
     uuid_index_path = layout.staging / "audit_uuid" / f"job_{job_index:05d}.parquet"
@@ -469,7 +521,6 @@ def _scan_audit_files(
     os.replace(uuid_partial, uuid_index_path)
 
     samples = {}
-    validation_candidates = {}
     for source in SOURCES:
         name = source.name
         values = [item[1] for item in sample_heaps[name]]
@@ -485,22 +536,9 @@ def _scan_audit_files(
             }
             for item, token_ids in zip(values, encoded)
         ]
-        candidates = [item[1] for item in validation_heaps[name]]
-        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
-        validation_candidates[name] = [
-            {
-                "validation_key": item[0],
-                "uuid": item[1],
-                "raw_path": item[2],
-                "row_group": item[3],
-                "row_index": item[4],
-            }
-            for item in candidates
-        ]
     return {
         "stats": stats,
         "samples": samples,
-        "validation_candidates": validation_candidates,
         "uuid_index": {
             "path": str(uuid_index_path.relative_to(layout.staging)),
             "rows": len(uuid_entries),
@@ -561,7 +599,6 @@ def finalize_audit(layout: DataLayout, job_count: int, sample_per_source: int, o
         )
         combined_stats = {}
         combined_samples = {}
-        validation_documents = {}
         selection_thresholds = {}
         for source in SOURCES:
             name = source.name
@@ -593,21 +630,6 @@ def finalize_audit(layout: DataLayout, job_count: int, sample_per_source: int, o
             }
             combined_stats[name] = source_stats
 
-            candidates = [
-                item
-                for report in reports
-                for item in report["audit"]["validation_candidates"][name]
-                if item["uuid"] not in duplicate_uuids
-            ]
-            candidates.sort(key=lambda item: (item["validation_key"], item["uuid"], item["raw_path"]))
-            deduped = {}
-            for item in candidates:
-                deduped.setdefault(item["uuid"], item)
-            selected_validation = sorted(deduped.values(), key=lambda item: item["validation_key"])[:VALIDATION_SEQUENCES]
-            if len(selected_validation) != VALIDATION_SEQUENCES:
-                raise RuntimeError(f"Not enough validation documents for {name}")
-            validation_documents[name] = selected_validation
-
             ratio = combined_samples[name]["tokens_per_utf8_byte"]
             estimated_token_ids = source_stats["utf8_bytes"] * ratio + source_stats["valid_rows"]
             required_ids = 2 * source.sequences_per_segment * ROW_WIDTH
@@ -621,9 +643,11 @@ def finalize_audit(layout: DataLayout, job_count: int, sample_per_source: int, o
             }
 
         audit = {
-            "format": "nemotron-audit-v1",
+            "format": "nemotron-audit-v2",
             "dataset_revision": DATASET_REVISION,
             "tokenizer_revision": TOKENIZER_REVISION,
+            "preprocessing_recipe": PREPROCESSING_RECIPE,
+            "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
             "master_seed": MASTER_SEED,
             "derived_seeds": SEEDS,
             "job_count": job_count,
@@ -635,8 +659,12 @@ def finalize_audit(layout: DataLayout, job_count: int, sample_per_source: int, o
             "selection_thresholds": selection_thresholds,
         }
         _atomic_json(layout.staging / "audit.json", audit)
-        _atomic_json(layout.staging / "validation_documents.json", validation_documents)
-        complete = {"stage": "audit", "status": "complete", "audit_path": str(layout.staging / "audit.json")}
+        complete = {
+            "stage": "audit",
+            "status": "complete",
+            "audit_path": str(layout.staging / "audit.json"),
+            "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+        }
         _status(layout, "audit", complete)
         return complete
 
@@ -662,9 +690,16 @@ def run_audit(
         mirrored = mirror_raw_files(layout, files, job_index, job_count)
     else:
         mirrored = [entry["path"] for entry in assigned]
-        missing = [path for path in mirrored if not (layout.raw / path).is_file()]
-        if missing:
-            raise FileNotFoundError(f"--skip-mirror was used but raw files are missing, first: {missing[0]}")
+        invalid = [
+            entry["path"]
+            for entry in assigned
+            if not (layout.raw / entry["path"]).is_file()
+            or (layout.raw / entry["path"]).stat().st_size != entry["size_bytes"]
+        ]
+        if invalid:
+            raise FileNotFoundError(
+                f"--skip-mirror was used but raw files are missing or truncated, first: {invalid[0]}"
+            )
     tokenizer = RustBPETokenizer.from_directory(layout.tokenizer)
     audit = _scan_audit_files(layout, assigned, tokenizer, sample_per_source, job_index)
     payload = {
@@ -674,6 +709,7 @@ def run_audit(
         "job_count": job_count,
         "mirrored_files": mirrored,
         "audit": audit,
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
     }
     _status(layout, "audit", payload, job_index)
     complete = finalize_audit(layout, job_count, sample_per_source, oversample)
@@ -687,7 +723,9 @@ TOKENIZED_SCHEMA = pa.schema(
         ("validation_key", pa.binary(32)),
         ("uuid", pa.string()),
         ("segment", pa.uint8()),
-        ("is_validation", pa.bool_()),
+        ("is_train_candidate", pa.bool_()),
+        ("is_validation_candidate", pa.bool_()),
+        ("token_count", pa.uint32()),
         ("tokens", pa.list_(pa.uint16())),
     ]
 )
@@ -698,7 +736,6 @@ def _tokenize_raw_file(
     entry: dict,
     tokenizer: RustBPETokenizer,
     threshold: int,
-    validation_uuids: set[str],
     duplicate_uuids: set[str],
     batch_size: int,
 ) -> dict:
@@ -709,11 +746,18 @@ def _tokenize_raw_file(
     if output_path.is_file() and status_path.is_file():
         with open(status_path, "r", encoding="utf-8") as handle:
             status = json.load(handle)
-        if status.get("sha256") == sha256_file(output_path):
+        if (
+            status.get("preprocessing_recipe_sha256") == PREPROCESSING_RECIPE_SHA256
+            and status.get("sha256") == sha256_file(output_path)
+        ):
             return status
 
     candidates = []
     seen = set()
+    validation_threshold = min(
+        (1 << 256) - 1,
+        math.ceil(VALIDATION_CANDIDATE_FRACTION * (1 << 256)) - 1,
+    )
     parquet = pq.ParquetFile(layout.raw / entry["path"])
     for row_group in range(parquet.num_row_groups):
         table = parquet.read_row_group(row_group, columns=["text", "uuid"])
@@ -724,13 +768,23 @@ def _tokenize_raw_file(
                 continue
             seen.add(uuid)
             selection_key = document_key(uuid, "selection")
-            is_validation = uuid in validation_uuids
-            if not is_validation and int.from_bytes(selection_key, "big") > threshold:
+            validation_key = document_key(uuid, "validation")
+            is_train_candidate = int.from_bytes(selection_key, "big") <= threshold
+            is_validation_candidate = int.from_bytes(validation_key, "big") <= validation_threshold
+            if not is_train_candidate and not is_validation_candidate:
                 continue
             partition_key = document_key(uuid, "segment_partition")
             segment = int.from_bytes(partition_key[:8], "big") & 1
             candidates.append(
-                (selection_key, document_key(uuid, "validation"), uuid, segment, is_validation, text)
+                (
+                    selection_key,
+                    validation_key,
+                    uuid,
+                    segment,
+                    is_train_candidate,
+                    is_validation_candidate,
+                    text,
+                )
             )
     candidates.sort(key=lambda item: (item[0], item[2]))
 
@@ -741,7 +795,7 @@ def _tokenize_raw_file(
     try:
         for start in range(0, len(candidates), batch_size):
             batch = candidates[start : start + batch_size]
-            token_lists = tokenizer.encode([item[5] for item in batch], num_threads=8)
+            token_lists = tokenizer.encode([item[6] for item in batch], num_threads=8)
             for token_ids in token_lists:
                 if token_ids and (min(token_ids) < 0 or max(token_ids) > 65_535):
                     raise RuntimeError("Tokenizer emitted an ID outside uint16")
@@ -753,6 +807,8 @@ def _tokenize_raw_file(
                     pa.array([item[2] for item in batch], type=pa.string()),
                     pa.array([item[3] for item in batch], type=pa.uint8()),
                     pa.array([item[4] for item in batch], type=pa.bool_()),
+                    pa.array([item[5] for item in batch], type=pa.bool_()),
+                    pa.array([len(token_ids) for token_ids in token_lists], type=pa.uint32()),
                     pa.array(token_lists, type=pa.list_(pa.uint16())),
                 ],
                 schema=TOKENIZED_SCHEMA,
@@ -766,12 +822,105 @@ def _tokenize_raw_file(
         "raw_path": entry["path"],
         "path": str(output_path.relative_to(layout.staging)),
         "documents": len(candidates),
+        "train_candidate_documents": sum(bool(item[4]) for item in candidates),
+        "validation_candidate_documents": sum(bool(item[5]) for item in candidates),
         "content_tokens": selected_tokens,
         "size_bytes": output_path.stat().st_size,
         "sha256": sha256_file(output_path),
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
     }
     _atomic_json(status_path, status)
     return status
+
+
+def _document_packed_capacity(token_count: int) -> int:
+    if token_count <= 0:
+        return 0
+    return token_count + math.ceil(token_count / CONTEXT_LENGTH)
+
+
+def finalize_validation_plan(layout: DataLayout) -> dict:
+    """Select a deterministic token-capacity holdout from tokenized candidates."""
+    path = layout.staging / "validation_plan.json"
+    lock_path = layout.staging / "status" / "tokenize" / "validation_plan.lock"
+    with FileLock(str(lock_path)):
+        if path.is_file():
+            with open(path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+            if existing.get("preprocessing_recipe_sha256") == PREPROCESSING_RECIPE_SHA256:
+                existing["sha256"] = sha256_file(path)
+                return existing
+
+        per_source = {}
+        for source in SOURCES:
+            candidates = []
+            input_paths = sorted((layout.staging / "tokenized" / source.name).glob("*.parquet"))
+            if not input_paths:
+                raise RuntimeError(f"No tokenized inputs found for {source.name}")
+            for input_path in input_paths:
+                parquet = pq.ParquetFile(input_path)
+                columns = ["validation_key", "uuid", "is_validation_candidate", "token_count"]
+                for batch in parquet.iter_batches(batch_size=8192, columns=columns):
+                    for record in batch.to_pylist():
+                        if record["is_validation_candidate"] and record["token_count"] > 0:
+                            candidates.append(
+                                (
+                                    bytes(record["validation_key"]),
+                                    record["uuid"],
+                                    int(record["token_count"]),
+                                )
+                            )
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            target_rows = VALIDATION_SEQUENCES_BY_SOURCE[source.name]
+            required_capacity = target_rows * ROW_WIDTH
+            reserved_capacity = math.ceil(required_capacity * VALIDATION_CAPACITY_OVERSAMPLE)
+            selected = []
+            capacity = 0
+            prior_uuid = None
+            for validation_key, uuid, token_count in candidates:
+                if uuid == prior_uuid:
+                    continue
+                prior_uuid = uuid
+                selected.append(
+                    {
+                        "uuid": uuid,
+                        "validation_key": validation_key.hex(),
+                        "token_count": token_count,
+                    }
+                )
+                capacity += _document_packed_capacity(token_count)
+                if capacity >= reserved_capacity:
+                    break
+            if capacity < reserved_capacity:
+                raise RuntimeError(
+                    f"Validation candidate capacity for {source.name} is {capacity:,} IDs, "
+                    f"below the reserved target {reserved_capacity:,}"
+                )
+            per_source[source.name] = {
+                "source_id": source.source_id,
+                "sequence_count": target_rows,
+                "token_count": target_rows * CONTEXT_LENGTH,
+                "required_packed_capacity": required_capacity,
+                "reserved_packed_capacity": reserved_capacity,
+                "selected_packed_capacity": capacity,
+                "candidate_document_count": len(candidates),
+                "selected_document_count": len(selected),
+                "documents": selected,
+            }
+
+        plan = {
+            "format": "nemotron-validation-plan-v2",
+            "preprocessing_recipe": PREPROCESSING_RECIPE,
+            "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+            "sequence_count": VALIDATION_SEQUENCE_COUNT,
+            "token_count": VALIDATION_SEQUENCE_COUNT * CONTEXT_LENGTH,
+            "candidate_fraction": VALIDATION_CANDIDATE_FRACTION,
+            "capacity_oversample": VALIDATION_CAPACITY_OVERSAMPLE,
+            "per_source": per_source,
+        }
+        _atomic_json(path, plan)
+        plan["sha256"] = sha256_file(path)
+        return plan
 
 
 def run_tokenize(
@@ -784,16 +933,14 @@ def run_tokenize(
 ) -> dict:
     check_free_space(layout.root, min_free_gb)
     audit_path = layout.staging / "audit.json"
-    validation_path = layout.staging / "validation_documents.json"
-    if not audit_path.is_file() or not validation_path.is_file():
+    if not audit_path.is_file():
         raise RuntimeError("The aggregate audit must complete before tokenization")
     with open(audit_path, "r", encoding="utf-8") as handle:
         audit = json.load(handle)
-    with open(validation_path, "r", encoding="utf-8") as handle:
-        validation_docs = json.load(handle)
+    if audit.get("preprocessing_recipe_sha256") != PREPROCESSING_RECIPE_SHA256:
+        raise RuntimeError("Audit preprocessing recipe does not match this build")
     with open(layout.staging / "duplicate_uuids.json", "r", encoding="utf-8") as handle:
         duplicate_uuids = set(json.load(handle)["uuids"])
-    validation_sets = {name: {item["uuid"] for item in items} for name, items in validation_docs.items()}
     tokenizer = RustBPETokenizer.from_directory(layout.tokenizer)
     outputs = []
     files = load_dataset_inventory(layout)
@@ -804,7 +951,7 @@ def run_tokenize(
         threshold = int(audit["selection_thresholds"][name]["sha256_threshold"], 16)
         outputs.append(
             _tokenize_raw_file(
-                layout, entry, tokenizer, threshold, validation_sets[name], duplicate_uuids, batch_size
+                layout, entry, tokenizer, threshold, duplicate_uuids, batch_size
             )
         )
     payload = {
@@ -813,11 +960,24 @@ def run_tokenize(
         "job_index": job_index,
         "job_count": job_count,
         "outputs": outputs,
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
     }
     _status(layout, "tokenize", payload, job_index)
     reports = [layout.staging / "status" / "tokenize" / f"job_{i:05d}.json" for i in range(job_count)]
     if all(path.is_file() for path in reports):
-        _status(layout, "tokenize", {"stage": "tokenize", "status": "complete", "job_count": job_count})
+        plan = finalize_validation_plan(layout)
+        _status(
+            layout,
+            "tokenize",
+            {
+                "stage": "tokenize",
+                "status": "complete",
+                "job_count": job_count,
+                "validation_plan": str(layout.staging / "validation_plan.json"),
+                "validation_plan_sha256": plan["sha256"],
+                "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+            },
+        )
         payload["aggregate_status"] = "complete"
     else:
         payload["aggregate_status"] = "waiting_for_other_jobs"
@@ -853,6 +1013,16 @@ def iter_tokenized_documents(
     paths = sorted((layout.staging / "tokenized" / source_name).glob("*.parquet"))
     if not paths:
         raise RuntimeError(f"No tokenized inputs found for {source_name}")
+    plan_path = layout.staging / "validation_plan.json"
+    if not plan_path.is_file():
+        raise RuntimeError("Validation plan must be finalized before packing")
+    with open(plan_path, "r", encoding="utf-8") as handle:
+        plan = json.load(handle)
+    if plan.get("preprocessing_recipe_sha256") != PREPROCESSING_RECIPE_SHA256:
+        raise RuntimeError("Validation plan preprocessing recipe does not match this build")
+    validation_uuids = {
+        item["uuid"] for item in plan["per_source"][source_name]["documents"]
+    }
     cursors = [_TokenizedCursor(path) for path in paths]
     heap = []
     for cursor_index, cursor in enumerate(cursors):
@@ -879,9 +1049,12 @@ def iter_tokenized_documents(
                 stats["duplicate_uuids"] += 1
                 continue
             last_uuid = uuid
-            if bool(record["is_validation"]) != validation:
+            is_validation = uuid in validation_uuids
+            if is_validation != validation:
                 continue
-            if not validation and int(record["segment"]) != segment:
+            if not validation and (
+                not bool(record["is_train_candidate"]) or int(record["segment"]) != segment
+            ):
                 continue
             tokens = record["tokens"]
             if not tokens:
@@ -1083,17 +1256,27 @@ def _pack_unit(
 ) -> dict:
     unit_name = f"validation-{source.source_id}" if segment is None else f"segment-{segment}-{source.source_id}"
     status_path = layout.staging / "status" / "pack_units" / f"{unit_name}.json"
+    validation_plan_sha256 = sha256_file(layout.staging / "validation_plan.json")
+    validation = segment is None
+    target_rows = (
+        VALIDATION_SEQUENCES_BY_SOURCE[source.name]
+        if validation
+        else source.sequences_per_segment
+    )
     if status_path.is_file():
         with open(status_path, "r", encoding="utf-8") as handle:
             previous = json.load(handle)
-        if _verified_shards(previous, layout.staging):
+        if (
+            previous.get("preprocessing_recipe_sha256") == PREPROCESSING_RECIPE_SHA256
+            and previous.get("validation_plan_sha256") == validation_plan_sha256
+            and previous.get("sequence_count") == target_rows
+            and _verified_shards(previous, layout.staging)
+        ):
             return previous
 
-    validation = segment is None
     documents, input_stats = iter_tokenized_documents(
         layout, source.name, segment=segment, validation=validation
     )
-    target_rows = VALIDATION_SEQUENCES if validation else source.sequences_per_segment
     output_dir = (
         layout.staging / "pools" / "validation" / source.name
         if validation
@@ -1116,6 +1299,8 @@ def _pack_unit(
         "segment": segment,
         "sequence_count": target_rows,
         "token_count": target_rows * CONTEXT_LENGTH,
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+        "validation_plan_sha256": validation_plan_sha256,
         "input_stats": input_stats,
         "packer_stats": packer.stats,
         "shards": shards,
@@ -1136,6 +1321,10 @@ def run_pack(
     check_free_space(layout.root, min_free_gb)
     if not (layout.staging / "status" / "tokenize" / "complete.json").is_file():
         raise RuntimeError("All tokenization jobs must complete before packing")
+    with open(layout.staging / "status" / "tokenize" / "complete.json", "r", encoding="utf-8") as handle:
+        tokenize_status = json.load(handle)
+    if tokenize_status.get("preprocessing_recipe_sha256") != PREPROCESSING_RECIPE_SHA256:
+        raise RuntimeError("Tokenized data preprocessing recipe does not match this build")
     with open(layout.tokenizer / "artifact.json", "r", encoding="utf-8") as handle:
         artifact = json.load(handle)
     units = [(source, segment) for segment in (0, 1, None) for source in SOURCES]
@@ -1149,12 +1338,34 @@ def run_pack(
         "job_index": job_index,
         "job_count": job_count,
         "units": [output["unit"] for output in outputs],
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
     }
     _status(layout, "pack", payload, job_index)
     expected = [layout.staging / "status" / "pack_units" / f"segment-{segment}-{source.source_id}.json" for segment in (0, 1) for source in SOURCES]
     expected += [layout.staging / "status" / "pack_units" / f"validation-{source.source_id}.json" for source in SOURCES]
     if all(path.is_file() for path in expected):
-        _status(layout, "pack", {"stage": "pack", "status": "complete", "unit_count": len(expected)})
+        validation_plan_sha256 = sha256_file(layout.staging / "validation_plan.json")
+        statuses = []
+        for path in expected:
+            with open(path, "r", encoding="utf-8") as handle:
+                statuses.append(json.load(handle))
+        if any(
+            status.get("preprocessing_recipe_sha256") != PREPROCESSING_RECIPE_SHA256
+            or status.get("validation_plan_sha256") != validation_plan_sha256
+            for status in statuses
+        ):
+            raise RuntimeError("Pack unit status was produced by an incompatible recipe or validation plan")
+        _status(
+            layout,
+            "pack",
+            {
+                "stage": "pack",
+                "status": "complete",
+                "unit_count": len(expected),
+                "validation_plan_sha256": validation_plan_sha256,
+                "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+            },
+        )
         payload["aggregate_status"] = "complete"
     else:
         payload["aggregate_status"] = "waiting_for_other_jobs"
@@ -1205,11 +1416,16 @@ def _write_final_segment(
 ) -> dict:
     unit = f"train_segment_{segment:03d}"
     status_path = layout.staging / "status" / "shuffle_units" / f"{unit}.json"
+    validation_plan_sha256 = sha256_file(layout.staging / "validation_plan.json")
     if status_path.is_file():
         with open(status_path, "r", encoding="utf-8") as handle:
             previous = json.load(handle)
         all_entries = previous.get("shards", []) + previous.get("source_id_shards", [])
-        if _verified_shards({"shards": all_entries}, layout.packed):
+        if (
+            previous.get("preprocessing_recipe_sha256") == PREPROCESSING_RECIPE_SHA256
+            and previous.get("validation_plan_sha256") == validation_plan_sha256
+            and _verified_shards({"shards": all_entries}, layout.packed)
+        ):
             return previous
 
     pool_statuses = {
@@ -1289,6 +1505,8 @@ def _write_final_segment(
         "seed": seed,
         "sequence_count": total_rows,
         "token_count": total_rows * CONTEXT_LENGTH,
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+        "validation_plan_sha256": validation_plan_sha256,
         "per_source": {
             source.name: {
                 "source_id": source.source_id,
@@ -1307,14 +1525,21 @@ def _write_final_segment(
 def _write_final_validation(layout: DataLayout, source: SourceSpec, shard_gb: float) -> dict:
     unit = f"validation-{source.source_id}"
     status_path = layout.staging / "status" / "shuffle_units" / f"{unit}.json"
+    validation_plan_sha256 = sha256_file(layout.staging / "validation_plan.json")
+    target_rows = VALIDATION_SEQUENCES_BY_SOURCE[source.name]
     if status_path.is_file():
         with open(status_path, "r", encoding="utf-8") as handle:
             previous = json.load(handle)
-        if _verified_shards(previous, layout.packed):
+        if (
+            previous.get("preprocessing_recipe_sha256") == PREPROCESSING_RECIPE_SHA256
+            and previous.get("validation_plan_sha256") == validation_plan_sha256
+            and previous.get("sequence_count") == target_rows
+            and _verified_shards(previous, layout.packed)
+        ):
             return previous
     pool = _read_pack_status(layout, unit)
     reader = _PoolReader(layout.staging, pool["shards"])
-    if reader.row_count != VALIDATION_SEQUENCES:
+    if reader.row_count != target_rows:
         raise RuntimeError(f"Validation quota is not exact for {source.name}")
     rows_per_shard = max(1, int(shard_gb * (1 << 30)) // (ROW_WIDTH * 2))
     writer = _BinaryShardWriter(layout.packed / "validation" / source.name, rows_per_shard)
@@ -1331,8 +1556,10 @@ def _write_final_validation(layout: DataLayout, source: SourceSpec, shard_gb: fl
         "unit": unit,
         "source": source.name,
         "source_id": source.source_id,
-        "sequence_count": VALIDATION_SEQUENCES,
-        "token_count": VALIDATION_SEQUENCES * CONTEXT_LENGTH,
+        "sequence_count": target_rows,
+        "token_count": target_rows * CONTEXT_LENGTH,
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+        "validation_plan_sha256": validation_plan_sha256,
         "shards": shards,
     }
     _atomic_json(status_path, status)
@@ -1360,7 +1587,7 @@ def finalize_manifest(layout: DataLayout) -> dict:
     provenance_files = {}
     for source_path, filename in (
         (layout.staging / "audit.json", "audit.json"),
-        (layout.staging / "validation_documents.json", "validation_documents.json"),
+        (layout.staging / "validation_plan.json", "validation_plan.json"),
         (layout.staging / "duplicate_uuids.json", "duplicate_uuids.json"),
         (layout.staging / "upstream_inventory.json", "upstream_inventory.json"),
     ):
@@ -1394,14 +1621,27 @@ def finalize_manifest(layout: DataLayout) -> dict:
             "token_count": 2 * SEGMENT_TOKEN_COUNT,
         },
     }
+    validation_shards = []
+    validation_per_source = {}
+    validation_offset = 0
     for source in SOURCES:
         report = validation_reports[source.name]
-        splits[f"validation/{source.name}"] = {
-            "source": source.name,
+        validation_per_source[source.name] = {
+            "source_id": source.source_id,
+            "start_sequence": validation_offset,
             "sequence_count": report["sequence_count"],
             "token_count": report["token_count"],
-            "shards": report["shards"],
         }
+        validation_shards.extend(report["shards"])
+        validation_offset += report["sequence_count"]
+    if validation_offset != VALIDATION_SEQUENCE_COUNT:
+        raise RuntimeError("Ratio-matched validation reports do not sum to the configured total")
+    splits["validation"] = {
+        "sequence_count": VALIDATION_SEQUENCE_COUNT,
+        "token_count": VALIDATION_SEQUENCE_COUNT * CONTEXT_LENGTH,
+        "per_source": validation_per_source,
+        "shards": validation_shards,
+    }
 
     manifest = {
         "format": MANIFEST_FORMAT,
@@ -1423,6 +1663,9 @@ def finalize_manifest(layout: DataLayout) -> dict:
             "derived_seeds": SEEDS,
             "packer_version": PACKER_VERSION,
             "sampler_version": SAMPLER_VERSION,
+            "preprocessing_recipe": PREPROCESSING_RECIPE,
+            "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+            "validation_plan_sha256": sha256_file(layout.staging / "validation_plan.json"),
         },
         "sources": [
             {
@@ -1458,6 +1701,10 @@ def run_shuffle(
     check_free_space(layout.root, min_free_gb)
     if not (layout.staging / "status" / "pack" / "complete.json").is_file():
         raise RuntimeError("All source pools must complete before shuffling")
+    with open(layout.staging / "status" / "pack" / "complete.json", "r", encoding="utf-8") as handle:
+        pack_status = json.load(handle)
+    if pack_status.get("preprocessing_recipe_sha256") != PREPROCESSING_RECIPE_SHA256:
+        raise RuntimeError("Packed data preprocessing recipe does not match this build")
     units = [("segment", segment) for segment in (0, 1)] + [("validation", source) for source in SOURCES]
     completed = []
     for unit_index, (kind, value) in enumerate(units):
@@ -1473,22 +1720,29 @@ def run_shuffle(
         "job_index": job_index,
         "job_count": job_count,
         "units": completed,
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
     }
     _status(layout, "shuffle", payload, job_index)
     expected = [layout.staging / "status" / "shuffle_units" / f"train_segment_{segment:03d}.json" for segment in (0, 1)]
     expected += [layout.staging / "status" / "shuffle_units" / f"validation-{source.source_id}.json" for source in SOURCES]
     if all(path.is_file() for path in expected):
-        manifest = finalize_manifest(layout)
-        _status(
-            layout,
-            "shuffle",
-            {
-                "stage": "shuffle",
-                "status": "complete",
-                "manifest": str(layout.packed / "manifest.json"),
-                "manifest_sha256": manifest["canonical_manifest_sha256"],
-            },
-        )
+        lock_path = layout.staging / "status" / "shuffle" / "finalize.lock"
+        with FileLock(str(lock_path)):
+            manifest = finalize_manifest(layout)
+            _status(
+                layout,
+                "shuffle",
+                {
+                    "stage": "shuffle",
+                    "status": "complete",
+                    "manifest": str(layout.packed / "manifest.json"),
+                    "manifest_sha256": manifest["canonical_manifest_sha256"],
+                    "validation_plan_sha256": sha256_file(
+                        layout.staging / "validation_plan.json"
+                    ),
+                    "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+                },
+            )
         payload["aggregate_status"] = "complete"
     else:
         payload["aggregate_status"] = "waiting_for_other_jobs"
@@ -1498,6 +1752,12 @@ def run_shuffle(
 def run_verify(layout: DataLayout, *, tokenizer_hash_files: bool = True) -> dict:
     manifest_path = layout.packed / "manifest.json"
     manifest = load_manifest(manifest_path)
+    packing = manifest["packing"]
+    if packing.get("preprocessing_recipe_sha256") != PREPROCESSING_RECIPE_SHA256:
+        raise RuntimeError("Manifest preprocessing recipe does not match this build")
+    validation_plan_path = layout.staging / "validation_plan.json"
+    if packing.get("validation_plan_sha256") != sha256_file(validation_plan_path):
+        raise RuntimeError("Manifest validation plan hash does not match staging")
     verify_tokenizer_artifact(manifest, layout.tokenizer, hash_files=tokenizer_hash_files)
     checked_files = 0
     checked_bytes = 0
@@ -1543,6 +1803,22 @@ def run_verify(layout: DataLayout, *, tokenizer_hash_files: bool = True) -> dict
             checked_files += 1
             checked_bytes += path.stat().st_size
 
+    validation = manifest["splits"].get("validation")
+    if validation is None or validation["sequence_count"] != VALIDATION_SEQUENCE_COUNT:
+        raise RuntimeError("Ratio-matched validation split is missing or has the wrong size")
+    expected_offset = 0
+    for source in SOURCES:
+        report = validation["per_source"].get(source.name)
+        expected_count = VALIDATION_SEQUENCES_BY_SOURCE[source.name]
+        if report != {
+            "source_id": source.source_id,
+            "start_sequence": expected_offset,
+            "sequence_count": expected_count,
+            "token_count": expected_count * CONTEXT_LENGTH,
+        }:
+            raise RuntimeError(f"Validation source range is incorrect for {source.name}")
+        expected_offset += expected_count
+
     result = {
         "stage": "verify",
         "status": "complete",
@@ -1551,6 +1827,8 @@ def run_verify(layout: DataLayout, *, tokenizer_hash_files: bool = True) -> dict
         "checked_bytes": checked_bytes,
         "train_50b_tokens": manifest["splits"]["train_50b"]["token_count"],
         "train_100b_tokens": manifest["splits"]["train_100b"]["token_count"],
+        "validation_tokens": validation["token_count"],
+        "preprocessing_recipe_sha256": PREPROCESSING_RECIPE_SHA256,
     }
     _status(layout, "verify", result)
     return result

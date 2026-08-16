@@ -843,7 +843,7 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             targets = build_mtp_targets(targets, head_idx)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly
@@ -896,7 +896,7 @@ class GPT(nn.Module):
         logits = self.lm_head(hidden_states)[..., :self.config.vocab_size].float()
         logits = softcap * torch.tanh(logits / softcap)
         ntp_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
         )
         rsm_loss = self.rsm_loss(
             hidden_states,

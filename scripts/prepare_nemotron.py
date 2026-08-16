@@ -10,6 +10,8 @@ from nanochat.nemotron_data import (
     DEFAULT_DATA_ROOT,
     DEFAULT_MIN_FREE_GB,
     DEFAULT_SHARD_GB,
+    PREPROCESSING_RECIPE,
+    PREPROCESSING_RECIPE_SHA256,
     data_layout,
     initialize_layout,
     reject_repository_local_root,
@@ -84,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         initialize_layout(layout)
         resolved = {
             "data_root": str(layout.root),
+            "recipe": PREPROCESSING_RECIPE,
+            "recipe_sha256": PREPROCESSING_RECIPE_SHA256,
+            "recipe_root": str(layout.recipe_root),
             "raw": str(layout.raw),
             "staging": str(layout.staging),
             "packed": str(layout.packed),

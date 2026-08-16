@@ -141,7 +141,9 @@ def test_sequential_head_backward_matches_one_combined_backward():
     targets = torch.randint(0, reference.config.vocab_size, (2, 8))
 
     reference_losses = all_head_losses(reference, idx, targets)
-    torch.stack(reference_losses).mean().backward()
+    # Meta's MTP objective gives every future-token head unit weight, so the
+    # aggregate objective is a sum rather than a mean across heads.
+    torch.stack(reference_losses).sum().backward()
 
     trunk_backward_calls = 0
 
@@ -156,7 +158,7 @@ def test_sequential_head_backward_matches_one_combined_backward():
     assert head_state[0].is_leaf and head_state[1].is_leaf and head_state[2].is_leaf
     for head_idx in range(sequential.mtp_n):
         loss = sequential.forward_mtp_head(head_state, targets, head_idx=head_idx)
-        (loss / sequential.mtp_n).backward()
+        loss.backward()
         assert trunk_backward_calls == 0
     backward_mtp_trunk(trunk_state, head_state)
     hook.remove()

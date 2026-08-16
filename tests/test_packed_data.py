@@ -4,30 +4,39 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
 import nanochat.nemotron_data as nemotron_data
 from nanochat.nemotron_data import (
+    PREPROCESSING_RECIPE,
     SEGMENT_SEQUENCE_COUNT,
     SEGMENT_TOKEN_COUNT,
     SOURCES,
+    VALIDATION_SEQUENCE_COUNT,
+    VALIDATION_SEQUENCES_BY_SOURCE,
     LosslessBestFitPacker,
+    data_layout,
     reject_repository_local_root,
 )
 from nanochat.packed_data import (
     MANIFEST_FORMAT,
     ManifestError,
+    build_packed_batch_schedule,
     compute_manifest_hash,
     load_manifest,
     packed_distributed_data_loader_with_state,
+    packed_distributed_validation_loader,
     sequence_ids_for_microbatch,
     sha256_file,
     tokenizer_artifact_hash,
     validate_training_compatibility,
     write_manifest,
 )
-from nanochat.checkpoint_manager import load_optimizer_state_resharded
+from nanochat.loss_eval import evaluate_loss_and_bpb_by_source
+from nanochat.checkpoint_manager import delete_checkpoint, load_optimizer_state_resharded
 from nanochat.gpt import GPT, GPTConfig
 
 
@@ -126,6 +135,70 @@ def test_exact_production_quotas():
         707_840,
         107_520,
     ]
+    assert VALIDATION_SEQUENCE_COUNT == 12_288
+    assert [VALIDATION_SEQUENCES_BY_SOURCE[source.name] for source in SOURCES] == [
+        6_110,
+        3_745,
+        1_139,
+        881,
+        359,
+        54,
+    ]
+    assert sum(VALIDATION_SEQUENCES_BY_SOURCE.values()) == VALIDATION_SEQUENCE_COUNT
+    assert VALIDATION_SEQUENCE_COUNT * 2048 == 25_165_824
+
+
+def test_recipe_layout_reuses_raw_but_isolates_derived_data(tmp_path):
+    layout = data_layout(tmp_path)
+    assert layout.raw == layout.dataset_root / "raw"
+    assert layout.recipe_root == layout.dataset_root / "recipes" / PREPROCESSING_RECIPE
+    assert layout.staging == layout.recipe_root / "staging"
+    assert layout.packed == layout.recipe_root / "packed" / "v1"
+
+
+def test_validation_plan_selects_by_exact_token_capacity(tmp_path, monkeypatch):
+    layout = data_layout(tmp_path)
+    (layout.staging / "status" / "tokenize").mkdir(parents=True)
+    monkeypatch.setattr(
+        nemotron_data,
+        "VALIDATION_SEQUENCES_BY_SOURCE",
+        {source.name: 1 for source in SOURCES},
+    )
+    monkeypatch.setattr(nemotron_data, "VALIDATION_CAPACITY_OVERSAMPLE", 1.0)
+    for source in SOURCES:
+        output_dir = layout.staging / "tokenized" / source.name
+        output_dir.mkdir(parents=True)
+        records = [
+            {
+                "selection_key": b"\x02" * 32,
+                "validation_key": b"\x02" * 32,
+                "uuid": f"{source.source_id}-later",
+                "segment": 0,
+                "is_train_candidate": True,
+                "is_validation_candidate": True,
+                "token_count": 2_100,
+                "tokens": [2] * 2_100,
+            },
+            {
+                "selection_key": b"\x01" * 32,
+                "validation_key": b"\x01" * 32,
+                "uuid": f"{source.source_id}-first",
+                "segment": 1,
+                "is_train_candidate": True,
+                "is_validation_candidate": True,
+                "token_count": 2_100,
+                "tokens": [3] * 2_100,
+            },
+        ]
+        table = pa.Table.from_pylist(records, schema=nemotron_data.TOKENIZED_SCHEMA)
+        pq.write_table(table, output_dir / "part.parquet")
+    plan = nemotron_data.finalize_validation_plan(layout)
+    for source in SOURCES:
+        report = plan["per_source"][source.name]
+        assert report["sequence_count"] == 1
+        assert report["selected_document_count"] == 1
+        assert report["documents"][0]["uuid"] == f"{source.source_id}-first"
+        assert report["selected_packed_capacity"] >= 2_049
 
 
 def test_download_atomic_retries_truncated_response(tmp_path, monkeypatch):
@@ -210,11 +283,74 @@ def test_resume_and_shard_boundary_are_exact(tmp_path):
     )
     x, y, state = next(loader)
     assert state["global_sequence_offset"] == 4
+    assert x.is_contiguous()
+    assert y.is_contiguous()
     assert np.array_equal(x.numpy(), expected[4:8, :-1])
     assert np.array_equal(y.numpy(), expected[4:8, 1:])
     x, _, state = next(loader)
     assert state["optimizer_step"] == 2
     assert np.array_equal(x.numpy(), expected[8:12, :-1])
+
+
+def test_validation_loader_returns_source_ids_from_contiguous_ranges(tmp_path):
+    path, manifest, _ = _manifest_fixture(tmp_path)
+    validation_rows = np.arange(30, dtype=np.uint16).reshape(6, 5)
+    validation_rows[:, 0] = 1
+    validation_shard = _write_rows(tmp_path / "validation.bin", validation_rows)
+    manifest["sources"] = [
+        {"source_id": 0, "name": "source-a", "ratio_units": 1},
+        {"source_id": 1, "name": "source-b", "ratio_units": 2},
+    ]
+    manifest["splits"]["validation"] = {
+        "sequence_count": 6,
+        "token_count": 24,
+        "shards": [validation_shard],
+        "per_source": {
+            "source-a": {
+                "source_id": 0,
+                "start_sequence": 0,
+                "sequence_count": 2,
+                "token_count": 8,
+            },
+            "source-b": {
+                "source_id": 1,
+                "start_sequence": 2,
+                "sequence_count": 4,
+                "token_count": 16,
+            },
+        },
+    }
+    write_manifest(path, manifest)
+    loader = packed_distributed_validation_loader(
+        path, "validation", 3, 4, "cpu", return_source_ids=True
+    )
+    _x, _y, source_ids = next(loader)
+    assert source_ids.tolist() == [0, 0, 1]
+    _x, _y, source_ids = next(loader)
+    assert source_ids.tolist() == [1, 1, 1]
+
+
+def test_mixed_validation_metrics_preserve_exact_per_source_statistics():
+    class FakeModel:
+        def get_device(self):
+            return torch.device("cpu")
+
+        def __call__(self, x, _y, loss_reduction):
+            assert loss_reduction == "none"
+            # GPT cross-entropy returns a flat vector for reduction="none".
+            return x.float().reshape(-1)
+
+    x = torch.tensor([[1, 1], [1, 1], [3, 3], [3, 3]])
+    y = torch.full_like(x, 2)
+    source_ids = torch.tensor([0, 0, 1, 1])
+    token_bytes = torch.tensor([0, 0, 1])
+    metrics = evaluate_loss_and_bpb_by_source(
+        FakeModel(), [(x, y, source_ids)], 1, token_bytes, num_sources=2
+    )
+    assert metrics["per_source"][0]["loss"] == pytest.approx(1.0)
+    assert metrics["per_source"][1]["loss"] == pytest.approx(3.0)
+    assert metrics["aggregate"]["loss"] == pytest.approx(2.0)
+    assert metrics["aggregate"]["bpb"] == pytest.approx(2.0 / np.log(2))
 
 
 def test_rank_mapping_is_contiguous_for_gradient_accumulation():
@@ -250,15 +386,14 @@ def test_tokenizer_and_target_mismatch_fail_before_training(tmp_path):
         target_tokens=-1,
         global_token_batch=16,
     ) == 128
-    with pytest.raises(ManifestError, match="divisible"):
-        validate_training_compatibility(
-            manifest,
-            "train_50b",
-            tokenizer_dir,
-            context_length=4,
-            target_tokens=124,
-            global_token_batch=16,
-        )
+    assert validate_training_compatibility(
+        manifest,
+        "train_50b",
+        tokenizer_dir,
+        context_length=4,
+        target_tokens=124,
+        global_token_batch=16,
+    ) == 124
     artifact["revision"] = "wrong"
     (tokenizer_dir / "artifact.json").write_text(json.dumps(artifact), encoding="utf-8")
     with pytest.raises(ManifestError, match="revision"):
@@ -270,6 +405,60 @@ def test_tokenizer_and_target_mismatch_fail_before_training(tmp_path):
             target_tokens=-1,
             global_token_batch=16,
         )
+
+
+def test_exact_batch_schedule_shortens_only_at_token_boundaries():
+    counts, offsets = build_packed_batch_schedule(
+        99_347_333_120,
+        1_024 * 2_048,
+        2_048,
+        (1_000_341_504, 9_999_745_024, 49_673_666_560),
+    )
+    assert len(counts) == 47_374
+    assert offsets[477] * 2_048 == 1_000_341_504
+    assert offsets[4_769] * 2_048 == 9_999_745_024
+    assert offsets[23_687] * 2_048 == 49_673_666_560
+    assert offsets[-1] * 2_048 == 99_347_333_120
+    assert counts.count(256) == 2
+    assert counts.count(1_024) == 47_372
+
+
+def test_scheduled_loader_emits_exact_partial_global_batches(tmp_path):
+    path, _, expected = _manifest_fixture(tmp_path)
+    counts = [4, 2, 4]
+    loaders = [
+        packed_distributed_data_loader_with_state(
+            path,
+            "train_50b",
+            2,
+            4,
+            "cpu",
+            16,
+            rank=rank,
+            world_size=2,
+            batch_sequence_counts=counts,
+        )
+        for rank in range(2)
+    ]
+    offset = 0
+    for step, count in enumerate(counts):
+        batches = [next(loader) for loader in loaders]
+        observed = np.concatenate([batch[0].numpy() for batch in batches], axis=0)
+        assert np.array_equal(observed, expected[offset : offset + count, :-1])
+        assert all(batch[2]["optimizer_step"] == step for batch in batches)
+        assert all(batch[2]["global_batch_sequences"] == count for batch in batches)
+        offset += count
+
+
+def test_checkpoint_deletion_is_rank_local_and_idempotent(tmp_path):
+    for name in ("model_003000.pt", "meta_003000.json", "optim_003000_rank0.pt", "optim_003000_rank1.pt"):
+        (tmp_path / name).write_bytes(b"checkpoint")
+    delete_checkpoint(tmp_path, 3_000, rank=1)
+    assert not (tmp_path / "optim_003000_rank1.pt").exists()
+    assert (tmp_path / "model_003000.pt").exists()
+    delete_checkpoint(tmp_path, 3_000, rank=0)
+    delete_checkpoint(tmp_path, 3_000, rank=0)
+    assert not list(tmp_path.iterdir())
 
 
 def test_lossless_packer_preserves_oversized_document_tokens():

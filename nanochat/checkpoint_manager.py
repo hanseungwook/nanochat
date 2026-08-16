@@ -4,8 +4,12 @@ Utilities for saving and loading model/optim/state checkpoints.
 import os
 import re
 import json
+import fcntl
+import socket
 import logging
 import math
+import time
+import zipfile
 import torch
 
 from nanochat.common import get_base_dir
@@ -16,6 +20,9 @@ from nanochat.common import setup_default_logging
 # Set up logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
+CHECKPOINT_SCHEMA_VERSION = 2
+
+
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
@@ -50,24 +57,303 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0("Patching missing x0_lambdas in model data to 0.0")
 
+
+def _dist_barrier():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _atomic_torch_save(data, path):
+    """Serialize beside the destination and publish it with one atomic rename."""
+    temporary = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(temporary, "wb") as handle:
+            torch.save(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_json_save(data, path):
+    temporary = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _optimizer_world_size(meta_data):
+    packed_data = meta_data.get("packed_data") or {}
+    value = packed_data.get("optimizer_world_size", meta_data.get("optimizer_world_size", 1))
+    value = int(value)
+    if value < 1:
+        raise ValueError("Checkpoint optimizer world size must be positive")
+    return value
+
+
+def checkpoint_paths(checkpoint_dir, step, optimizer_world_size):
+    """Return the required files for a fully resumable training checkpoint."""
+    paths = [
+        os.path.join(checkpoint_dir, f"model_{step:06d}.pt"),
+        os.path.join(checkpoint_dir, f"meta_{step:06d}.json"),
+    ]
+    paths.extend(
+        os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank}.pt")
+        for rank in range(optimizer_world_size)
+    )
+    return paths
+
+
+def completion_marker_path(checkpoint_dir, step):
+    return os.path.join(checkpoint_dir, f"complete_{step:06d}.json")
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    meta_data = dict(meta_data)
+    meta_data["step"] = step
+    meta_data["checkpoint_schema_version"] = CHECKPOINT_SCHEMA_VERSION
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        optimizer_world_size = torch.distributed.get_world_size()
+    else:
+        optimizer_world_size = 1
+    meta_data["optimizer_world_size"] = optimizer_world_size
     if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        # A retry of the same step is incomplete again until its new files have
+        # all landed, so withdraw any prior commit marker first.
+        try:
+            os.remove(completion_marker_path(checkpoint_dir, step))
+        except FileNotFoundError:
+            pass
+    if optimizer_data is not None:
+        _dist_barrier()
+    if rank == 0:
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
+        _atomic_torch_save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
         # Save the metadata dict as json
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
+        _atomic_json_save(meta_data, meta_path)
         logger.info(f"Saved metadata to: {meta_path}")
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
-        os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
+        _atomic_torch_save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+    # Training checkpoints are a collective because optimizer state is sharded.
+    # Model-only RL checkpoints are intentionally saved by rank 0 alone.
+    if optimizer_data is not None:
+        _dist_barrier()
+    if rank == 0:
+        required_paths = checkpoint_paths(checkpoint_dir, step, optimizer_world_size)
+        if optimizer_data is None:
+            required_paths = required_paths[:2]
+        missing = [path for path in required_paths if not os.path.isfile(path) or os.path.getsize(path) == 0]
+        if missing:
+            raise RuntimeError(f"Checkpoint step {step} is incomplete after distributed save: {missing}")
+        marker = {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "step": step,
+            "optimizer_world_size": optimizer_world_size,
+            "has_optimizer": optimizer_data is not None,
+            "files": {os.path.basename(path): os.path.getsize(path) for path in required_paths},
+            "completed_at_unix": time.time(),
+        }
+        marker_path = completion_marker_path(checkpoint_dir, step)
+        _atomic_json_save(marker, marker_path)
+        logger.info(f"Committed complete checkpoint marker: {marker_path}")
+    if optimizer_data is not None:
+        _dist_barrier()
+
+
+def _torch_archive_is_readable(path):
+    """Cheaply validate the central directory of a modern torch.save archive."""
+    try:
+        return os.path.getsize(path) > 0 and zipfile.is_zipfile(path)
+    except OSError:
+        return False
+
+
+def validate_checkpoint_files(checkpoint_dir, step, require_optimizer=True):
+    """Validate one candidate without materializing its tensors.
+
+    Marker-backed checkpoints are atomic by construction. Legacy checkpoints
+    from jobs launched before schema v2 are accepted only when their metadata,
+    model archive, and every recorded optimizer shard are present and readable.
+    """
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta_data = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        return False, None, f"metadata is unreadable: {exc}"
+    if not isinstance(meta_data, dict):
+        return False, None, "metadata is not a JSON object"
+    try:
+        metadata_step = int(meta_data.get("step", -1))
+    except (TypeError, ValueError) as exc:
+        return False, meta_data, f"metadata step is invalid: {exc}"
+    if metadata_step != step:
+        return False, meta_data, "metadata step does not match filename"
+    try:
+        optimizer_world_size = _optimizer_world_size(meta_data)
+    except (TypeError, ValueError) as exc:
+        return False, meta_data, str(exc)
+
+    required_paths = checkpoint_paths(checkpoint_dir, step, optimizer_world_size)
+    if not require_optimizer:
+        required_paths = required_paths[:2]
+    try:
+        missing = [path for path in required_paths if not os.path.isfile(path) or os.path.getsize(path) == 0]
+    except OSError as exc:
+        return False, meta_data, f"checkpoint files could not be inspected: {exc}"
+    if missing:
+        return False, meta_data, f"missing required files: {[os.path.basename(path) for path in missing]}"
+
+    marker_path = completion_marker_path(checkpoint_dir, step)
+    if os.path.isfile(marker_path):
+        try:
+            with open(marker_path, "r", encoding="utf-8") as handle:
+                marker = json.load(handle)
+        except (OSError, ValueError, TypeError) as exc:
+            return False, meta_data, f"completion marker is unreadable: {exc}"
+        if not isinstance(marker, dict):
+            return False, meta_data, "completion marker is not a JSON object"
+        try:
+            marker_step = int(marker.get("step", -1))
+            marker_world_size = int(marker.get("optimizer_world_size", -1))
+        except (TypeError, ValueError) as exc:
+            return False, meta_data, f"completion marker fields are invalid: {exc}"
+        if marker_step != step:
+            return False, meta_data, "completion marker step does not match filename"
+        if marker_world_size != optimizer_world_size:
+            return False, meta_data, "completion marker optimizer world size does not match metadata"
+        if require_optimizer and not marker.get("has_optimizer", False):
+            return False, meta_data, "completion marker has no optimizer state"
+        recorded_files = marker.get("files", {})
+        if not isinstance(recorded_files, dict):
+            return False, meta_data, "completion marker files field is not a JSON object"
+        for path in required_paths:
+            basename = os.path.basename(path)
+            try:
+                recorded_size = int(recorded_files.get(basename, -1))
+                actual_size = os.path.getsize(path)
+            except (OSError, TypeError, ValueError) as exc:
+                return False, meta_data, f"completion marker size is invalid for {basename}: {exc}"
+            if recorded_size != actual_size:
+                return False, meta_data, f"completion marker size mismatch for {basename}"
+        archive_paths = [required_paths[0], *required_paths[2:]] if require_optimizer else [required_paths[0]]
+        unreadable = [path for path in archive_paths if not _torch_archive_is_readable(path)]
+        if unreadable:
+            return False, meta_data, f"torch archives are unreadable: {[os.path.basename(path) for path in unreadable]}"
+        return True, meta_data, None
+
+    # Legacy fallback for checkpoints produced by already-running jobs. A
+    # partially written torch zip lacks a readable central directory.
+    archive_paths = [required_paths[0], *required_paths[2:]] if require_optimizer else [required_paths[0]]
+    unreadable = [path for path in archive_paths if not _torch_archive_is_readable(path)]
+    if unreadable:
+        return False, meta_data, f"legacy torch archives are unreadable: {[os.path.basename(path) for path in unreadable]}"
+    return True, meta_data, None
+
+
+def find_latest_complete_checkpoint(checkpoint_dir, require_optimizer=True):
+    """Return ``(step, metadata)`` for the newest valid checkpoint, or None."""
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    candidate_steps = set()
+    for filename in os.listdir(checkpoint_dir):
+        match = re.fullmatch(r"(?:model|meta|complete)_(\d+)\.(?:pt|json)", filename)
+        if match:
+            candidate_steps.add(int(match.group(1)))
+    for step in sorted(candidate_steps, reverse=True):
+        valid, meta_data, reason = validate_checkpoint_files(
+            checkpoint_dir, step, require_optimizer=require_optimizer
+        )
+        if valid:
+            return step, meta_data
+        log0(f"Skipping incomplete checkpoint step {step}: {reason}")
+    return None
+
+
+def list_complete_checkpoint_steps(checkpoint_dir, require_optimizer=True):
+    """List valid checkpoint steps in ascending order."""
+    if not os.path.isdir(checkpoint_dir):
+        return []
+    candidate_steps = set()
+    for filename in os.listdir(checkpoint_dir):
+        match = re.fullmatch(r"(?:model|meta|complete)_(\d+)\.(?:pt|json)", filename)
+        if match:
+            candidate_steps.add(int(match.group(1)))
+    complete_steps = []
+    for step in sorted(candidate_steps):
+        valid, _, reason = validate_checkpoint_files(
+            checkpoint_dir, step, require_optimizer=require_optimizer
+        )
+        if valid:
+            complete_steps.append(step)
+        else:
+            log0(f"Ignoring incomplete checkpoint step {step} during retention: {reason}")
+    return complete_steps
+
+
+def acquire_run_lock(checkpoint_dir, owner=None):
+    """Hold an advisory lock for one training process tree using a run tag."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, ".run.lock")
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        current_owner = handle.read().strip() or "unknown owner"
+        handle.close()
+        raise RuntimeError(f"Run checkpoint directory is already locked by {current_owner}: {checkpoint_dir}")
+    handle.seek(0)
+    handle.truncate()
+    lock_owner = owner or f"pid={os.getpid()} host={socket.gethostname()}"
+    handle.write(lock_owner + "\n")
+    handle.flush()
+    return handle
+
+
+def delete_checkpoint(checkpoint_dir, step, rank=0):
+    """Delete one rank's files for an explicitly resolved checkpoint step."""
+    if rank == 0:
+        try:
+            os.remove(completion_marker_path(checkpoint_dir, step))
+            logger.info(f"Removed expired checkpoint marker for step {step}")
+        except FileNotFoundError:
+            pass
+    _dist_barrier()
+    paths = [os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")]
+    if rank == 0:
+        paths.extend(
+            [
+                os.path.join(checkpoint_dir, f"model_{step:06d}.pt"),
+                os.path.join(checkpoint_dir, f"meta_{step:06d}.json"),
+            ]
+        )
+    for path in paths:
+        try:
+            os.remove(path)
+            logger.info(f"Removed expired checkpoint file: {path}")
+        except FileNotFoundError:
+            pass
+    _dist_barrier()
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state

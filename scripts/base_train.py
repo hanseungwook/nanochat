@@ -14,7 +14,10 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import hashlib
 import json
+import signal
+import socket
 import time
 import math
 import argparse
@@ -31,6 +34,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.packed_data import (
     SAMPLER_VERSION,
     PackedShardReader,
+    build_packed_batch_schedule,
     load_manifest,
     packed_distributed_data_loader_with_state,
     packed_distributed_validation_loader,
@@ -39,8 +43,16 @@ from nanochat.packed_data import (
 )
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, load_optimizer_state_resharded
-from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb
+from nanochat.checkpoint_manager import (
+    acquire_run_lock,
+    delete_checkpoint,
+    find_latest_complete_checkpoint,
+    list_complete_checkpoint_steps,
+    load_checkpoint,
+    load_optimizer_state_resharded,
+    save_checkpoint,
+)
+from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb_by_source
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
@@ -54,7 +66,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 data_root = os.environ.get("NANOCHAT_DATA_ROOT")
-default_manifest = os.path.join(data_root, "datasets", "nemotron-specialized-v1", "9ed3718b5f2ae29074c5e34e64115432b7c4320f", "packed", "v1", "manifest.json") if data_root else None
+default_manifest = os.path.join(data_root, "datasets", "nemotron-specialized-v1", "9ed3718b5f2ae29074c5e34e64115432b7c4320f", "recipes", "ratio-validation-v2", "packed", "v1", "manifest.json") if data_root else None
 default_tokenizer_dir = os.path.join(data_root, "tokenizers", "nanochat-d32", "016dba034c9c0ca9033ad1bc721bceff54680600") if data_root else None
 parser.add_argument("--dataset-manifest", type=str, default=default_manifest, help="packed dataset manifest (unset preserves the ClimbMix loader)")
 parser.add_argument("--dataset-split", type=str, default="train_50b", choices=["train_50b", "train_100b"], help="named packed training split")
@@ -93,6 +105,8 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--auto-resume", action="store_true", help="resume from the newest complete checkpoint in this model-tag directory")
+parser.add_argument("--stop-after-step", type=int, default=-1, help="save and exit at this optimizer step (-1 = run to horizon)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -101,7 +115,10 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--keep-last-periodic-checkpoints", type=int, default=-1, help="retain only the latest N non-milestone periodic checkpoints (-1 = retain all)")
 parser.add_argument("--save-at-steps", type=str, default="", help="comma-separated additional optimizer steps to checkpoint")
+parser.add_argument("--save-at-tokens", type=str, default="", help="comma-separated exact packed-token boundaries to checkpoint")
+parser.add_argument("--no-save", action="store_true", help="disable all checkpoint writes (for short memory/throughput probes)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -111,6 +128,14 @@ except ValueError:
     parser.error("--save-at-steps must be a comma-separated list of integers")
 if any(step <= 0 for step in save_at_steps):
     parser.error("--save-at-steps values must be positive")
+if args.keep_last_periodic_checkpoints < -1:
+    parser.error("--keep-last-periodic-checkpoints must be -1 or non-negative")
+try:
+    save_at_tokens = {int(value) for value in args.save_at_tokens.split(",") if value.strip()}
+except ValueError:
+    parser.error("--save-at-tokens must be a comma-separated list of integers")
+if any(tokens <= 0 for tokens in save_at_tokens):
+    parser.error("--save-at-tokens values must be positive")
 if args.rsm and args.mtp_n != 1:
     parser.error("--rsm requires --mtp-n=1; joint MTP+RSM is out of scope")
 if args.rsm_loss_weight < 0:
@@ -123,6 +148,10 @@ if args.rsm_pairs_per_sequence < 1:
     parser.error("--rsm-pairs-per-sequence must be positive")
 if args.rsm_seed < 0:
     parser.error("--rsm-seed must be non-negative")
+if args.stop_after_step < -1:
+    parser.error("--stop-after-step must be -1 or non-negative")
+if args.auto_resume and args.resume_from_step != -1:
+    parser.error("--auto-resume and --resume-from-step are mutually exclusive")
 rsm_config = {
     "enabled": args.rsm,
     "loss_weight": args.rsm_loss_weight,
@@ -133,6 +162,8 @@ rsm_config = {
 }
 packed_manifest = None
 packed_target_tokens = None
+packed_batch_sequence_counts = None
+packed_batch_offsets = None
 if args.dataset_manifest:
     if args.tokenizer_dir is None:
         parser.error("--tokenizer-dir is required with --dataset-manifest")
@@ -147,6 +178,20 @@ if args.dataset_manifest:
         target_tokens=args.target_train_tokens,
         global_token_batch=args.total_batch_size,
     )
+    try:
+        packed_batch_sequence_counts, packed_batch_offsets = build_packed_batch_schedule(
+            packed_target_tokens,
+            args.total_batch_size,
+            args.max_seq_len,
+            save_at_tokens,
+        )
+    except Exception as exc:
+        parser.error(str(exc))
+    offset_to_step = {offset: step for step, offset in enumerate(packed_batch_offsets)}
+    save_at_steps.update(
+        offset_to_step[tokens // args.max_seq_len]
+        for tokens in save_at_tokens
+    )
     # Stat every selected shard and validate its declared row/byte length before
     # model allocation. Full content checksums belong to prepare_nemotron verify.
     PackedShardReader(
@@ -154,11 +199,14 @@ if args.dataset_manifest:
         resolve_split_shards(packed_manifest, args.dataset_split),
         args.max_seq_len + 1,
     )
-    if args.num_iterations > 0 and args.num_iterations * args.total_batch_size != packed_target_tokens:
+    if args.num_iterations > 0 and args.num_iterations != len(packed_batch_sequence_counts):
         parser.error("--num-iterations conflicts with --target-train-tokens for packed data")
-user_config = vars(args).copy()  # for logging
+    if args.stop_after_step > len(packed_batch_sequence_counts):
+        parser.error("--stop-after-step exceeds the packed training horizon")
+elif save_at_tokens:
+    parser.error("--save-at-tokens requires packed data")
 # -----------------------------------------------------------------------------
-# Compute init and wandb logging
+# Compute init and checkpoint resolution
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
@@ -173,9 +221,159 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init
+# The production launcher leaves SIGUSR1 ignored in the torchrun supervisor;
+# each worker overrides that disposition here and records the request until the
+# next safe optimizer-step boundary.
+checkpoint_signal_received = False
+
+def request_checkpoint_on_signal(_signum, _frame):
+    global checkpoint_signal_received
+    checkpoint_signal_received = True
+
+if hasattr(signal, "SIGUSR1"):
+    signal.signal(signal.SIGUSR1, request_checkpoint_on_signal)
+
+# Resolve and exclusively lock the run directory before allocating model memory.
+base_dir = get_base_dir()
+if args.rsm:
+    default_model_tag = f"d{args.depth}-rsm"
+else:
+    default_model_tag = f"d{args.depth}" if args.mtp_n == 1 else f"d{args.depth}-mtp{args.mtp_n}"
+output_dirname = args.model_tag if args.model_tag else default_model_tag
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+run_lock = None
+run_lock_error = None
+if master_process:
+    owner = (
+        f"job={os.environ.get('SLURM_JOB_ID', 'local')} "
+        f"pid={os.getpid()} host={socket.gethostname()}"
+    )
+    try:
+        run_lock = acquire_run_lock(checkpoint_dir, owner=owner)
+    except RuntimeError as exc:
+        run_lock_error = str(exc)
+if is_ddp_initialized():
+    lock_status = torch.tensor(int(run_lock_error is None), dtype=torch.int32, device=device)
+    dist.broadcast(lock_status, src=0)
+    if not bool(lock_status.item()):
+        raise RuntimeError(run_lock_error or f"Run checkpoint directory is already locked: {checkpoint_dir}")
+elif run_lock_error is not None:
+    raise RuntimeError(run_lock_error)
+
+if args.auto_resume:
+    resolved_resume_step = -1
+    if master_process:
+        latest_checkpoint = find_latest_complete_checkpoint(checkpoint_dir, require_optimizer=True)
+        if latest_checkpoint is not None:
+            resolved_resume_step = latest_checkpoint[0]
+    if is_ddp_initialized():
+        resume_step_tensor = torch.tensor(resolved_resume_step, dtype=torch.int64, device=device)
+        dist.broadcast(resume_step_tensor, src=0)
+        resolved_resume_step = int(resume_step_tensor.item())
+    args.resume_from_step = resolved_resume_step
+    if resolved_resume_step == -1:
+        print0(f"Auto-resume found no complete checkpoint in {checkpoint_dir}; starting from initialization")
+    else:
+        print0(f"Auto-resume selected complete checkpoint step {resolved_resume_step:,}")
+
+resuming = args.resume_from_step != -1
+resume_meta = None
+if resuming:
+    meta_path = os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        resume_meta = json.load(f)
+    checkpoint_config = resume_meta["model_config"]
+    checkpoint_mtp_n = checkpoint_config.get("mtp_n", 1)
+    if checkpoint_mtp_n != args.mtp_n:
+        raise RuntimeError(f"Checkpoint mtp_n={checkpoint_mtp_n} does not match --mtp-n={args.mtp_n}")
+    if checkpoint_config["n_layer"] != args.depth:
+        raise RuntimeError(f"Checkpoint depth={checkpoint_config['n_layer']} does not match --depth={args.depth}")
+    validate_rsm_resume_config(resume_meta, rsm_config)
+
+    # These options affect parameterization, gradients, or the horizon-specific
+    # optimizer schedule. Logging and checkpoint cadence may safely change.
+    resume_critical_args = (
+        "dataset_split", "fp8", "fp8_recipe", "depth", "aspect_ratio",
+        "head_dim", "max_seq_len", "window_pattern", "mtp_n", "rsm",
+        "rsm_loss_weight", "rsm_max_horizon", "rsm_horizon_gamma",
+        "rsm_pairs_per_sequence", "rsm_seed", "num_iterations",
+        "target_flops", "target_param_data_ratio", "target_train_tokens",
+        "device_batch_size", "total_batch_size", "embedding_lr",
+        "unembedding_lr", "weight_decay", "matrix_lr", "scalar_lr",
+        "warmup_steps", "warmdown_ratio", "final_lr_frac",
+    )
+    saved_user_config = resume_meta.get("user_config") or {}
+    critical_mismatches = {
+        key: (saved_user_config[key], getattr(args, key))
+        for key in resume_critical_args
+        if key in saved_user_config and saved_user_config[key] != getattr(args, key)
+    }
+    saved_compute_dtype = resume_meta.get("compute_dtype")
+    if saved_compute_dtype is not None and saved_compute_dtype != str(COMPUTE_DTYPE):
+        critical_mismatches["compute_dtype"] = (saved_compute_dtype, str(COMPUTE_DTYPE))
+    if critical_mismatches:
+        raise RuntimeError(f"Training configuration changed across resume: {critical_mismatches}")
+
+    if packed_manifest is not None:
+        if not 0 <= args.resume_from_step <= len(packed_batch_offsets) - 1:
+            raise RuntimeError("Packed-data resume step is outside the batch schedule")
+        expected_packed = {
+            "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
+            "split": args.dataset_split,
+            "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
+            "optimizer_step": args.resume_from_step,
+            "global_sequence_offset": packed_batch_offsets[args.resume_from_step],
+            "global_batch_sequences": args.total_batch_size // args.max_seq_len,
+            "batch_boundary_tokens": sorted(save_at_tokens),
+            "context_length": args.max_seq_len,
+            "sampler_version": SAMPLER_VERSION,
+        }
+        saved_packed = resume_meta.get("packed_data")
+        if saved_packed is None:
+            raise RuntimeError("Cannot resume packed training from a checkpoint without packed-data metadata")
+        mismatches = {
+            key: (saved_packed.get(key), value)
+            for key, value in expected_packed.items()
+            if saved_packed.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(f"Packed-data checkpoint mismatch: {mismatches}")
+
+configured_horizon = (
+    len(packed_batch_sequence_counts)
+    if packed_batch_sequence_counts is not None
+    else (args.num_iterations if args.num_iterations > 0 else None)
+)
+if resuming and configured_horizon is not None and args.resume_from_step > configured_horizon:
+    raise RuntimeError(
+        f"Checkpoint step {args.resume_from_step} exceeds configured horizon {configured_horizon}"
+    )
+if args.auto_resume and resuming and configured_horizon is not None and args.resume_from_step == configured_horizon:
+    print0(
+        f"Run is already complete at step {configured_horizon:,}; "
+        "auto-resume has nothing to do"
+    )
+    if run_lock is not None:
+        run_lock.close()
+    compute_cleanup()
+    raise SystemExit(0)
+
+user_config = vars(args).copy()  # resolved inputs for logging and checkpoints
+user_config["resolved_resume_step"] = args.resume_from_step
+wandb_run_id = resume_meta.get("wandb_run_id") if resume_meta is not None else None
+if args.auto_resume and wandb_run_id is None:
+    wandb_identity = f"{os.path.abspath(checkpoint_dir)}\0{args.run}".encode("utf-8")
+    wandb_run_id = hashlib.sha256(wandb_identity).hexdigest()[:16]
+
+# wandb logging init. A stable ID joins all automatic restarts to one run.
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="rsm", name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    wandb_kwargs = {"project": "rsm", "name": args.run, "config": user_config}
+    if wandb_run_id is not None:
+        wandb_kwargs.update(id=wandb_run_id, resume="allow")
+    wandb_run = wandb.init(**wandb_kwargs)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -203,48 +401,6 @@ tokenizer = get_tokenizer(args.tokenizer_dir)
 token_bytes = get_token_bytes(device=device, tokenizer_dir=args.tokenizer_dir)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
-
-# Resolve checkpoint metadata before model allocation so incompatible packed-data
-# resumes fail without spending GPU memory.
-base_dir = get_base_dir()
-if args.rsm:
-    default_model_tag = f"d{args.depth}-rsm"
-else:
-    default_model_tag = f"d{args.depth}" if args.mtp_n == 1 else f"d{args.depth}-mtp{args.mtp_n}"
-output_dirname = args.model_tag if args.model_tag else default_model_tag
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
-resume_meta = None
-if resuming:
-    meta_path = os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        resume_meta = json.load(f)
-    checkpoint_config = resume_meta["model_config"]
-    checkpoint_mtp_n = checkpoint_config.get("mtp_n", 1)
-    assert checkpoint_mtp_n == args.mtp_n, f"Checkpoint mtp_n={checkpoint_mtp_n} does not match --mtp-n={args.mtp_n}"
-    assert checkpoint_config["n_layer"] == args.depth, f"Checkpoint depth={checkpoint_config['n_layer']} does not match --depth={args.depth}"
-    validate_rsm_resume_config(resume_meta, rsm_config)
-    if packed_manifest is not None:
-        expected_packed = {
-            "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
-            "split": args.dataset_split,
-            "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
-            "optimizer_step": args.resume_from_step,
-            "global_sequence_offset": args.resume_from_step * (args.total_batch_size // args.max_seq_len),
-            "global_batch_sequences": args.total_batch_size // args.max_seq_len,
-            "context_length": args.max_seq_len,
-            "sampler_version": SAMPLER_VERSION,
-        }
-        saved_packed = resume_meta.get("packed_data")
-        if saved_packed is None:
-            raise RuntimeError("Cannot resume packed training from a checkpoint without packed-data metadata")
-        mismatches = {
-            key: (saved_packed.get(key), value)
-            for key, value in expected_packed.items()
-            if saved_packed.get(key) != value
-        }
-        if mismatches:
-            raise RuntimeError(f"Packed-data checkpoint mismatch: {mismatches}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -488,6 +644,10 @@ if resuming:
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
+    if resuming and resume_meta.get("scaler_state") is not None:
+        scaler.load_state_dict(resume_meta["scaler_state"])
+elif resuming and resume_meta.get("scaler_state"):
+    raise RuntimeError("Checkpoint contains GradScaler state but this run is not using float16")
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -504,16 +664,18 @@ if packed_manifest is not None:
         rank=ddp_rank,
         world_size=ddp_world_size,
         data_cache_dir=args.data_cache_dir,
+        batch_sequence_counts=packed_batch_sequence_counts,
     )
-    build_val_loader = lambda split_name: packed_distributed_validation_loader(
+    build_val_loader = lambda: packed_distributed_validation_loader(
         args.dataset_manifest,
-        split_name,
+        "validation",
         eval_device_batch_size,
         args.max_seq_len,
         device,
         rank=ddp_rank,
         world_size=ddp_world_size,
         data_cache_dir=args.data_cache_dir,
+        return_source_ids=True,
     )
 else:
     dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
@@ -527,8 +689,8 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert packed_manifest is not None or args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if packed_manifest is not None:
-    num_iterations = packed_target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from packed token horizon: {num_iterations:,}")
+    num_iterations = len(packed_batch_sequence_counts)
+    print0(f"Calculated number of iterations from exact packed batch schedule: {num_iterations:,}")
 elif args.num_iterations > 0:
     # Override num_iterations to a specific value if given
     num_iterations = args.num_iterations
@@ -543,9 +705,9 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
+total_tokens = packed_target_tokens if packed_manifest is not None else total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+print0(f"Tokens : Scaling params ratio: {total_tokens / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -604,39 +766,53 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# All ranks collectively observe the signal flag. The handler itself performs
+# no I/O or distributed work.
+checkpoint_signal_tensor = torch.zeros((), dtype=torch.int32, device=device)
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    trained_tokens = (
+        packed_batch_offsets[step] * args.max_seq_len
+        if packed_manifest is not None
+        else total_batch_size * step
+    )
+    flops_so_far = num_flops_per_token * trained_tokens
+    local_checkpoint_request = checkpoint_signal_received
+    checkpoint_signal_received = False
+    checkpoint_signal_tensor.fill_(int(local_checkpoint_request))
+    if is_ddp_initialized():
+        dist.all_reduce(checkpoint_signal_tensor, op=dist.ReduceOp.MAX)
+    preemption_save = bool(checkpoint_signal_tensor.item())
+    if preemption_save:
+        print0(f"Received checkpoint signal; committing step {step:,} before shutdown")
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if not preemption_save and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         with disable_fp8(model):
             if packed_manifest is not None:
-                source_metrics = {}
-                for source in packed_manifest["sources"]:
-                    split_name = f"validation/{source['name']}"
-                    split_tokens = packed_manifest["splits"][split_name]["token_count"]
-                    eval_token_count = min(args.eval_tokens, split_tokens)
-                    eval_global_batch = eval_device_batch_size * args.max_seq_len * ddp_world_size
-                    eval_steps = eval_token_count // eval_global_batch
-                    if eval_steps < 1:
-                        raise RuntimeError(
-                            f"Packed validation split {split_name} is smaller than one global eval batch"
-                        )
-                    source_metrics[source["name"]] = evaluate_loss_and_bpb(
-                        model, build_val_loader(split_name), eval_steps, token_bytes
+                split = packed_manifest["splits"]["validation"]
+                eval_global_batch = eval_device_batch_size * args.max_seq_len * ddp_world_size
+                if split["token_count"] % eval_global_batch:
+                    raise RuntimeError(
+                        "The full packed validation set must be divisible by the global eval batch"
                     )
-                weight_sum = sum(source["ratio_units"] for source in packed_manifest["sources"])
-                val_bpb = sum(
-                    source_metrics[source["name"]]["bpb"] * source["ratio_units"]
+                eval_steps = split["token_count"] // eval_global_batch
+                metrics = evaluate_loss_and_bpb_by_source(
+                    model,
+                    build_val_loader(),
+                    eval_steps,
+                    token_bytes,
+                    num_sources=len(packed_manifest["sources"]),
+                )
+                val_bpb = metrics["aggregate"]["bpb"]
+                val_loss = metrics["aggregate"]["loss"]
+                source_metrics = {
+                    source["name"]: metrics["per_source"][source["source_id"]]
                     for source in packed_manifest["sources"]
-                ) / weight_sum
-                val_loss = sum(
-                    source_metrics[source["name"]]["loss"] * source["ratio_units"]
-                    for source in packed_manifest["sources"]
-                ) / weight_sum
+                }
             else:
                 val_loader = build_val_loader()
                 eval_steps = args.eval_tokens // (eval_device_batch_size * args.max_seq_len * ddp_world_size)
@@ -667,7 +843,7 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if not preemption_save and args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
@@ -682,7 +858,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    if not preemption_save and args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -704,7 +880,15 @@ while True:
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     periodic_save = step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0
     explicit_save = step > 0 and step != args.resume_from_step and step in save_at_steps
-    if last_step or periodic_save or explicit_save:
+    requested_stop = args.stop_after_step == step
+    if not args.no_save and (last_step or requested_stop or periodic_save or explicit_save or preemption_save):
+        checkpoint_reason = (
+            "final" if last_step else
+            "requested-stop" if requested_stop else
+            "preemption-signal" if preemption_save else
+            "milestone" if explicit_save else
+            "periodic"
+        )
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -716,6 +900,10 @@ while True:
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "rsm_config": rsm_config,
+                "compute_dtype": str(COMPUTE_DTYPE),
+                "scaler_state": None if scaler is None else scaler.state_dict(),
+                "wandb_run_id": wandb_run_id,
+                "checkpoint_reason": checkpoint_reason,
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
@@ -724,9 +912,10 @@ while True:
                     "manifest_sha256": packed_manifest["canonical_manifest_sha256"],
                     "split": args.dataset_split,
                     "tokenizer_sha256": packed_manifest["tokenizer"]["artifact_sha256"],
-                    "global_sequence_offset": step * (total_batch_size // args.max_seq_len),
+                    "global_sequence_offset": packed_batch_offsets[step],
                     "optimizer_step": step,
                     "global_batch_sequences": total_batch_size // args.max_seq_len,
+                    "batch_boundary_tokens": sorted(save_at_tokens),
                     "context_length": args.max_seq_len,
                     "sampler_version": SAMPLER_VERSION,
                     "optimizer_world_size": ddp_world_size,
@@ -739,9 +928,24 @@ while True:
             },
             rank=ddp_rank,
         )
+        if args.save_every > 0 and args.keep_last_periodic_checkpoints >= 0:
+            protected_steps = save_at_steps | {num_iterations}
+            ordinary_steps = [
+                saved_step
+                for saved_step in list_complete_checkpoint_steps(
+                    checkpoint_dir, require_optimizer=True
+                )
+                if saved_step not in protected_steps
+            ]
+            keep = args.keep_last_periodic_checkpoints
+            expired_steps = ordinary_steps if keep == 0 else ordinary_steps[:-keep]
+            for expired_step in expired_steps:
+                delete_checkpoint(checkpoint_dir, expired_step, rank=ddp_rank)
+    elif preemption_save:
+        print0("WARNING: checkpoint signal received while --no-save is active")
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
-    if last_step:
+    if last_step or requested_stop:
         break
 
     # -------------------------------------------------------------------------
@@ -754,6 +958,14 @@ while True:
     rsm_horizon_mean_f = None
     rsm_max_horizon_mean_f = None
     rsm_horizon_max_f = None
+    current_grad_accum_steps = dataloader_state_dict.get("micro_steps", grad_accum_steps)
+    step_batch_sequences = dataloader_state_dict.get(
+        "global_batch_sequences", total_batch_size // args.max_seq_len
+    )
+    step_batch_tokens = step_batch_sequences * args.max_seq_len
+    step_sequence_offset = dataloader_state_dict.get(
+        "global_sequence_offset", step * (total_batch_size // args.max_seq_len)
+    )
     if args.rsm:
         train_ntp_loss = torch.zeros((), device=device)
         train_rsm_loss = torch.zeros((), device=device)
@@ -761,7 +973,7 @@ while True:
         rsm_max_horizon_mean = torch.zeros((), device=device)
         rsm_horizon_max = torch.zeros((), device=device)
         bos_token_id = tokenizer.get_bos_token_id()
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(current_grad_accum_steps):
             samples = sample_rsm_batch(
                 x,
                 bos_token_id=bos_token_id,
@@ -782,17 +994,17 @@ while True:
                 samples.epsilon,
                 samples.tau,
             )
-            train_ntp_loss += ntp_loss.detach() / grad_accum_steps
-            train_rsm_loss += rsm_loss.detach() / grad_accum_steps
-            rsm_horizon_mean += samples.horizons.float().mean() / grad_accum_steps
-            rsm_max_horizon_mean += samples.max_horizons.float().mean() / grad_accum_steps
+            train_ntp_loss += ntp_loss.detach() / current_grad_accum_steps
+            train_rsm_loss += rsm_loss.detach() / current_grad_accum_steps
+            rsm_horizon_mean += samples.horizons.float().mean() / current_grad_accum_steps
+            rsm_max_horizon_mean += samples.max_horizons.float().mean() / current_grad_accum_steps
             rsm_horizon_max = torch.maximum(rsm_horizon_max, samples.horizons.max().float())
-            total_loss = (ntp_loss + args.rsm_loss_weight * rsm_loss) / grad_accum_steps
+            total_loss = (ntp_loss + args.rsm_loss_weight * rsm_loss) / current_grad_accum_steps
             if scaler is not None:
                 scaler.scale(total_loss).backward()
             else:
                 total_loss.backward()
-            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            need_next_batch = not (step == num_iterations - 1 and micro_step == current_grad_accum_steps - 1)
             if need_next_batch:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
@@ -804,15 +1016,15 @@ while True:
         rsm_max_horizon_mean_f = rsm_max_horizon_mean.item()
         rsm_horizon_max_f = rsm_horizon_max.item()
     elif args.mtp_n == 1:
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(current_grad_accum_steps):
             loss = model(x, y)
             train_loss = loss.detach() # for logging
-            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss = loss / current_grad_accum_steps # each .backward() is a grad sum => normalize loss here
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            need_next_batch = not (step == num_iterations - 1 and micro_step == current_grad_accum_steps - 1)
             if need_next_batch:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
@@ -823,13 +1035,16 @@ while True:
         # time. Each head accumulates gradients on detached trunk-boundary
         # tensors; after all heads finish, traverse the shared trunk once.
         train_head_losses = [torch.zeros((), device=device) for _ in range(args.mtp_n)]
-        for micro_step in range(grad_accum_steps):
+        for micro_step in range(current_grad_accum_steps):
             trunk_state = mtp_trunk_forward(x)
             head_state = detach_mtp_head_state(trunk_state)
             for head_idx, mtp_head_forward in enumerate(mtp_head_forwards):
                 head_loss = mtp_head_forward(head_state, y)
-                train_head_losses[head_idx] += head_loss.detach() / grad_accum_steps
-                scaled_head_loss = head_loss / (grad_accum_steps * args.mtp_n)
+                train_head_losses[head_idx] += head_loss.detach() / current_grad_accum_steps
+                # Match Meta's MTP objective: every future-token head has unit
+                # weight. Each head loss is already a mean over its valid
+                # tokens, and only gradient accumulation is normalized here.
+                scaled_head_loss = head_loss / current_grad_accum_steps
                 if scaler is not None:
                     scaler.scale(scaled_head_loss).backward()
                 else:
@@ -837,12 +1052,12 @@ while True:
                 del head_loss, scaled_head_loss
             backward_mtp_trunk(trunk_state, head_state)
             del trunk_state, head_state
-            need_next_batch = not (step == num_iterations - 1 and micro_step == grad_accum_steps - 1)
+            need_next_batch = not (step == num_iterations - 1 and micro_step == current_grad_accum_steps - 1)
             if need_next_batch:
                 data_wait_start = time.time()
                 x, y, dataloader_state_dict = next(train_loader)
                 data_wait_time += time.time() - data_wait_start
-        train_loss = torch.stack(train_head_losses).mean()
+        train_loss = torch.stack(train_head_losses).sum()
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -866,7 +1081,7 @@ while True:
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_head_loss_fs = [head_loss.item() for head_loss in train_head_losses] # GPU sync point(s)
-    train_loss_f = sum(train_head_loss_fs) / len(train_head_loss_fs)
+    train_loss_f = sum(train_head_loss_fs) if args.mtp_n > 1 else train_head_loss_fs[0]
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -877,8 +1092,8 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    tok_per_sec = int(step_batch_tokens / dt)
+    flops_per_sec = num_flops_per_token * step_batch_tokens / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     data_wait_pct = 100 * data_wait_time / dt
     if step > 10:
@@ -893,7 +1108,7 @@ while True:
     else:
         eta_str = ""
     if packed_manifest is not None:
-        epoch = f"global sequence offset: {step * (total_batch_size // args.max_seq_len):,}"
+        epoch = f"global sequence offset: {step_sequence_offset:,}"
     else:
         epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     mtp_loss_str = "" if args.mtp_n == 1 else " | mtp heads: " + ", ".join(f"t+{i}={loss:.4f}" for i, loss in enumerate(train_head_loss_fs, start=1))
@@ -950,4 +1165,6 @@ if val_bpb is not None:
 
 # cleanup
 wandb_run.finish() # wandb run finish
+if run_lock is not None:
+    run_lock.close()
 compute_cleanup()

@@ -32,7 +32,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb
+from nanochat.loss_eval import evaluate_bpb, evaluate_loss_and_bpb_by_source
 from nanochat.packed_data import load_manifest, packed_distributed_validation_loader
 from nanochat.engine import Engine
 
@@ -209,33 +209,29 @@ def main():
             manifest = load_manifest(manifest_path)
             if manifest["canonical_manifest_sha256"] != packed_meta["manifest_sha256"]:
                 raise RuntimeError("Evaluation manifest differs from checkpoint metadata")
-            weighted_bpb = 0.0
-            weighted_loss = 0.0
-            weight_sum = sum(source["ratio_units"] for source in manifest["sources"])
+            split = manifest["splits"]["validation"]
+            if split["token_count"] % tokens_per_step:
+                raise RuntimeError("The full packed validation set must divide the global eval batch")
+            steps = split["token_count"] // tokens_per_step
+            loader = packed_distributed_validation_loader(
+                manifest_path,
+                "validation",
+                args.device_batch_size,
+                sequence_len,
+                device,
+                rank=ddp_rank,
+                world_size=ddp_world_size,
+                return_source_ids=True,
+            )
+            all_metrics = evaluate_loss_and_bpb_by_source(
+                model, loader, steps, token_bytes, num_sources=len(manifest["sources"])
+            )
             for source in manifest["sources"]:
                 split_name = f"validation/{source['name']}"
-                split_tokens = min(args.split_tokens, manifest["splits"][split_name]["token_count"])
-                steps = split_tokens // tokens_per_step
-                if steps < 1:
-                    raise RuntimeError(f"{split_name} is smaller than one global evaluation batch")
-                loader = packed_distributed_validation_loader(
-                    manifest_path,
-                    split_name,
-                    args.device_batch_size,
-                    sequence_len,
-                    device,
-                    rank=ddp_rank,
-                    world_size=ddp_world_size,
-                )
-                metrics = evaluate_loss_and_bpb(model, loader, steps, token_bytes)
+                metrics = all_metrics["per_source"][source["source_id"]]
                 bpb_results[split_name] = metrics
-                weighted_bpb += metrics["bpb"] * source["ratio_units"]
-                weighted_loss += metrics["loss"] * source["ratio_units"]
                 print0(f"{split_name}: loss={metrics['loss']:.6f} bpb={metrics['bpb']:.6f}")
-            bpb_results["weighted"] = {
-                "loss": weighted_loss / weight_sum,
-                "bpb": weighted_bpb / weight_sum,
-            }
+            bpb_results["weighted"] = all_metrics["aggregate"]
             print0(
                 f"weighted validation: loss={bpb_results['weighted']['loss']:.6f} "
                 f"bpb={bpb_results['weighted']['bpb']:.6f}"
