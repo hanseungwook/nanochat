@@ -245,7 +245,6 @@ def initialize_layout(layout: DataLayout) -> None:
         layout.packed / "provenance",
         layout.tokenizer,
         layout.runtime / "base_checkpoints",
-        layout.runtime / "eval_bundle",
         layout.runtime / "logs",
         layout.runtime / "tmp",
     ):

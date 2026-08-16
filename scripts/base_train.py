@@ -954,45 +954,9 @@ while True:
         wandb_run.log(val_log)
         model.train()
 
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
-    results = {}
-    if not preemption_save and args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
-
-    # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
-    if not preemption_save and args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
-        model.train()
-
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
+    # Make the training artifact durable before optional post-step evaluations.
+    # In particular, a missing or unhealthy evaluation bundle must not discard
+    # the final trained state after the last validation has completed.
     periodic_save = step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0
     explicit_save = step > 0 and step != args.resume_from_step and step in save_at_steps
     requested_stop = args.stop_after_step == step
@@ -1058,6 +1022,44 @@ while True:
                 delete_checkpoint(checkpoint_dir, expired_step, rank=ddp_rank)
     elif preemption_save:
         print0("WARNING: checkpoint signal received while --no-save is active")
+
+    # once in a while: estimate the CORE metric (all ranks participate)
+    # use the original uncompiled model because the inputs keep changing shape
+    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
+    results = {}
+    if not preemption_save and args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+        model.eval()
+        with disable_fp8(orig_model):
+            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        wandb_run.log({
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "core_metric": results["core_metric"],
+            "centered_results": results["centered_results"],
+        })
+        model.train()
+
+    # once in a while: sample from the model (only on master process)
+    # use the original uncompiled model because the inputs keep changing shape
+    if not preemption_save and args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        model.eval()
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
+        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        for prompt in prompts:
+            tokens = tokenizer(prompt, prepend="<|bos|>")
+            with disable_fp8(orig_model):
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            print0(tokenizer.decode(sample[0]))
+        model.train()
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step or requested_stop:

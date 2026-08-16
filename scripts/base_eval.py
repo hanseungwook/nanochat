@@ -50,6 +50,8 @@ def place_eval_bundle(file_path):
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
             zip_ref.extractall(tmpdir)
         extracted_bundle_dir = os.path.join(tmpdir, "eval_bundle")
+        if os.path.isdir(eval_bundle_dir) and not os.listdir(eval_bundle_dir):
+            os.rmdir(eval_bundle_dir)
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
@@ -61,11 +63,13 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     """
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
-    # Download the eval bundle if needed
-    if not os.path.exists(eval_bundle_dir):
+    config_path = os.path.join(eval_bundle_dir, "core.yaml")
+    # Download the eval bundle if needed. Checking the actual manifest, rather
+    # than only the directory, prevents an empty runtime layout placeholder
+    # from suppressing the download.
+    if not os.path.isfile(config_path):
         download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
 
-    config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
     eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
 
