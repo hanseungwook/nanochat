@@ -666,7 +666,14 @@ class GPT(nn.Module):
         scalar_lr=0.5,
         include_mtp_aux=True,
         include_rsm=False,
+        optimizer_kind="muon",
+        adamw_lr=3e-4,
+        adamw_betas=(0.9, 0.95),
+        adamw_eps=1e-8,
+        adamw_weight_decay=0.1,
     ):
+        if optimizer_kind not in {"muon", "adamw"}:
+            raise ValueError(f"Unknown optimizer kind: {optimizer_kind}")
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
@@ -705,25 +712,44 @@ class GPT(nn.Module):
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        if optimizer_kind == "muon":
+            print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-        # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+        if optimizer_kind == "adamw":
+            # A conventional all-AdamW control. Matrix-like tensors receive
+            # decoupled weight decay; scalar gates and residual coefficients do
+            # not. Both groups otherwise share exactly the same optimizer
+            # hyperparameters and learning-rate schedule.
+            decay_params = [param for param in optimizer_params if param.ndim >= 2]
+            no_decay_params = [param for param in optimizer_params if param.ndim < 2]
+            param_groups = [
+                dict(
+                    kind='adamw', params=decay_params, lr=adamw_lr,
+                    betas=adamw_betas, eps=adamw_eps, weight_decay=adamw_weight_decay,
+                ),
+                dict(
+                    kind='adamw', params=no_decay_params, lr=adamw_lr,
+                    betas=adamw_betas, eps=adamw_eps, weight_decay=0.0,
+                ),
+            ]
+        else:
+            # Build the historical mixed Muon/AdamW groups unchanged.
+            param_groups = [
+                # AdamW groups (embeddings, lm_head, scalars)
+                dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+                dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+                dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+                dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+                dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+                dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            ]
+            # Muon groups (matrix params, grouped by shape for stacking)
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
 
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:

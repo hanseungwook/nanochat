@@ -96,6 +96,12 @@ parser.add_argument("--target-train-tokens", type=int, default=-1, help="packed-
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"], help="mixed Muon/AdamW (default) or AdamW for every trainable parameter")
+parser.add_argument("--adamw-lr", type=float, default=3e-4, help="all-AdamW learning rate at the 524,288-token reference batch")
+parser.add_argument("--adamw-beta1", type=float, default=0.9, help="all-AdamW first-moment decay")
+parser.add_argument("--adamw-beta2", type=float, default=0.95, help="all-AdamW second-moment decay")
+parser.add_argument("--adamw-eps", type=float, default=1e-8, help="all-AdamW numerical stability epsilon")
+parser.add_argument("--adamw-weight-decay", type=float, default=0.1, help="all-AdamW decay for matrix-like parameters")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
@@ -148,6 +154,14 @@ if args.rsm_pairs_per_sequence < 1:
     parser.error("--rsm-pairs-per-sequence must be positive")
 if args.rsm_seed < 0:
     parser.error("--rsm-seed must be non-negative")
+if args.adamw_lr <= 0:
+    parser.error("--adamw-lr must be positive")
+if not 0 <= args.adamw_beta1 < 1 or not 0 <= args.adamw_beta2 < 1:
+    parser.error("--adamw-beta1 and --adamw-beta2 must be in [0, 1)")
+if args.adamw_eps <= 0:
+    parser.error("--adamw-eps must be positive")
+if args.adamw_weight_decay < 0:
+    parser.error("--adamw-weight-decay must be non-negative")
 if args.stop_after_step < -1:
     parser.error("--stop-after-step must be -1 or non-negative")
 if args.auto_resume and args.resume_from_step != -1:
@@ -298,16 +312,25 @@ if resuming:
         "rsm_loss_weight", "rsm_max_horizon", "rsm_horizon_gamma",
         "rsm_pairs_per_sequence", "rsm_seed", "num_iterations",
         "target_flops", "target_param_data_ratio", "target_train_tokens",
-        "device_batch_size", "total_batch_size", "embedding_lr",
+        "device_batch_size", "total_batch_size", "optimizer", "embedding_lr",
         "unembedding_lr", "weight_decay", "matrix_lr", "scalar_lr",
         "warmup_steps", "warmdown_ratio", "final_lr_frac",
     )
+    if args.optimizer == "adamw":
+        resume_critical_args += (
+            "adamw_lr", "adamw_beta1", "adamw_beta2", "adamw_eps", "adamw_weight_decay",
+        )
     saved_user_config = resume_meta.get("user_config") or {}
     critical_mismatches = {
         key: (saved_user_config[key], getattr(args, key))
         for key in resume_critical_args
         if key in saved_user_config and saved_user_config[key] != getattr(args, key)
     }
+    # Checkpoints written before the optimizer selector existed used nanochat's
+    # historical mixed Muon/AdamW optimizer.
+    saved_optimizer = saved_user_config.get("optimizer", "muon")
+    if saved_optimizer != args.optimizer:
+        critical_mismatches["optimizer"] = (saved_optimizer, args.optimizer)
     saved_compute_dtype = resume_meta.get("compute_dtype")
     if saved_compute_dtype is not None and saved_compute_dtype != str(COMPUTE_DTYPE):
         critical_mismatches["compute_dtype"] = (saved_compute_dtype, str(COMPUTE_DTYPE))
@@ -610,11 +633,12 @@ if batch_ratio != 1.0:
 # λ = λ_ref · √(B/B_ref) · (D_ref/D)
 # Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
-if weight_decay_scaled != args.weight_decay:
+if args.optimizer == "muon" and weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the optimizer. Muon retains nanochat's historical parameter groups;
+# the AdamW control uses one optimizer family for every trainable parameter.
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
@@ -624,7 +648,19 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     include_rsm=args.rsm,
+    optimizer_kind=args.optimizer,
+    adamw_lr=args.adamw_lr * batch_lr_scale,
+    adamw_betas=(args.adamw_beta1, args.adamw_beta2),
+    adamw_eps=args.adamw_eps,
+    adamw_weight_decay=args.adamw_weight_decay,
 )
+if args.optimizer == "adamw":
+    print0(
+        "Using AdamW for all trainable parameters: "
+        f"lr={args.adamw_lr * batch_lr_scale:.6g}, "
+        f"betas=({args.adamw_beta1}, {args.adamw_beta2}), "
+        f"eps={args.adamw_eps:g}, matrix_weight_decay={args.adamw_weight_decay:g}"
+    )
 
 if resuming:
     if optimizer_data is None:

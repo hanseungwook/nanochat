@@ -194,6 +194,38 @@ def test_joint_forward_state_dict_optimizer_and_head_removal():
         torch.testing.assert_close(restored(tokens), logits)
 
 
+def test_all_adamw_optimizer_covers_ar_and_rsm_with_matched_hyperparameters():
+    for rsm_enabled in (False, True):
+        model = make_model(rsm=rsm_enabled)
+        optimizer = model.setup_optimizer(
+            include_rsm=rsm_enabled,
+            optimizer_kind="adamw",
+            adamw_lr=6e-4,
+            adamw_betas=(0.9, 0.95),
+            adamw_eps=1e-8,
+            adamw_weight_decay=0.1,
+        )
+
+        assert {group["kind"] for group in optimizer.param_groups} == {"adamw"}
+        assert {group["lr"] for group in optimizer.param_groups} == {6e-4}
+        assert {group["betas"] for group in optimizer.param_groups} == {(0.9, 0.95)}
+        assert {group["eps"] for group in optimizer.param_groups} == {1e-8}
+        assert {group["weight_decay"] for group in optimizer.param_groups} == {0.0, 0.1}
+
+        optimized = {id(param) for group in optimizer.param_groups for param in group["params"]}
+        assert optimized == {id(param) for param in model.parameters()}
+        decay_group = next(group for group in optimizer.param_groups if group["weight_decay"] == 0.1)
+        no_decay_group = next(group for group in optimizer.param_groups if group["weight_decay"] == 0.0)
+        assert all(param.ndim >= 2 for param in decay_group["params"])
+        assert all(param.ndim < 2 for param in no_decay_group["params"])
+        if rsm_enabled:
+            rsm_ids = {id(param) for param in model.rsm_parameters()}
+            assert rsm_ids <= {id(param) for param in decay_group["params"]}
+
+    with pytest.raises(ValueError, match="Unknown optimizer kind"):
+        make_model(rsm=False).setup_optimizer(optimizer_kind="sgd")
+
+
 def test_old_checkpoint_config_defaults_to_rsm_disabled():
     config = {"n_layer": 4, "window_pattern": "L", "mtp_n": 1}
     _patch_missing_config_keys(config)
